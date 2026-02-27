@@ -340,6 +340,44 @@ class TestFillHandling:
         assert loop._ledger.total_btc() == Decimal("0")
 
 
+class TestFifoSellFailureEscalation:
+    def test_sell_fifo_failure_triggers_risk_pause(self) -> None:
+        """A FIFO sell failure must trigger risk pause to stop trading."""
+        loop = _make_loop()
+        # Ledger is empty — selling will raise ValueError
+
+        class FakeSlot:
+            side = Side.SELL
+            slot_id = 0
+
+        loop.on_fill(FakeSlot(), {
+            "last_qty": "0.01",
+            "last_price": "85000",
+            "fee": "1.00",
+            "order_id": "O123",
+        })
+        assert not loop._risk.is_trading_allowed
+
+
+class TestRateLimiterGate:
+    def test_throttled_add_not_dispatched(self) -> None:
+        """When rate limiter is saturated, add commands should be skipped."""
+        from icryptotrader.order.rate_limiter import RateLimiter
+
+        rl = RateLimiter(max_counter=10, decay_rate=0.0, headroom_pct=0.5)
+        # Fill the counter well above threshold (5)
+        for _ in range(10):
+            rl.record_send(1.0)
+
+        loop = _make_loop()
+        loop._om._rate_limiter = rl
+
+        commands = loop.tick(mid_price=Decimal("85000"))
+        # All add commands should be throttled
+        assert len(commands) == 0
+        assert rl.throttle_count > 0
+
+
 class TestMetrics:
     def test_tick_duration_tracked(self) -> None:
         loop = _make_loop()

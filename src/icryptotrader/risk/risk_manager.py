@@ -239,6 +239,13 @@ class RiskManager:
         self._tax_locked = locked
         self._reconcile_pause_state()
 
+    def force_risk_pause(self) -> None:
+        """Force into risk pause state (e.g., ledger mismatch)."""
+        if self._pause_state != PauseState.RISK_PAUSE_ACTIVE:
+            self.risk_pauses += 1
+        self._pause_state = PauseState.RISK_PAUSE_ACTIVE
+        logger.warning("Risk: forced RISK_PAUSE (external trigger)")
+
     def force_active(self) -> None:
         """Force return to active trading (manual override)."""
         self._pause_state = PauseState.ACTIVE_TRADING

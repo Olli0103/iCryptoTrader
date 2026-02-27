@@ -397,6 +397,38 @@ class TestReconciliation:
         assert slot.order_id == "O999"
 
 
+    def test_reconcile_returns_orphan_ids(self) -> None:
+        """Orphan orders on the exchange are returned for the caller to cancel."""
+        om = OrderManager(num_slots=1)
+        # All local slots are empty — so orphan orders can't be matched
+        orphans = om.reconcile_snapshot(
+            open_orders=[
+                {"order_id": "ORPHAN1", "limit_price": "85000", "order_qty": "0.01"},
+                {"order_id": "ORPHAN2", "limit_price": "86000", "order_qty": "0.02"},
+            ],
+            recent_trades=[],
+        )
+        assert sorted(orphans) == ["ORPHAN1", "ORPHAN2"]
+
+    def test_reconcile_no_orphans_returns_empty_list(self) -> None:
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        slot.state = SlotState.LIVE
+        slot.order_id = "O123"
+        om._order_id_to_slot["O123"] = slot
+
+        orphans = om.reconcile_snapshot(
+            open_orders=[{
+                "order_id": "O123",
+                "limit_price": "85000",
+                "order_qty": "0.01",
+                "filled_qty": "0",
+            }],
+            recent_trades=[],
+        )
+        assert orphans == []
+
+
 class TestQueryMethods:
     def test_live_slots(self) -> None:
         om = OrderManager(num_slots=3)

@@ -427,10 +427,12 @@ class OrderManager:
 
     def reconcile_snapshot(
         self, open_orders: list[dict[str, Any]], recent_trades: list[dict[str, Any]]
-    ) -> None:
+    ) -> list[str]:
         """Reconcile local state against exchange snapshot after reconnect.
 
         Called after WS2 reconnects and receives executions snapshot.
+        Returns a list of orphan order IDs (orders on the exchange that
+        don't match any local slot). The caller should cancel these.
         """
         snapshot_order_ids = {o.get("order_id", ""): o for o in open_orders}
 
@@ -480,16 +482,15 @@ class OrderManager:
                 slot.state = SlotState.EMPTY
                 self._cleanup_slot_maps(slot)
 
-        # Orphan orders: in snapshot but not in any local slot — cancel them
+        # Orphan orders: in snapshot but not in any local slot — caller should cancel
         orphan_ids = list(snapshot_order_ids.keys())
         if orphan_ids:
             logger.warning(
                 "Found %d orphan orders after reconnect: %s",
                 len(orphan_ids), orphan_ids,
             )
-        # Caller should cancel these via WS2
 
-        return  # orphan_ids available via the snapshot_order_ids that remain
+        return orphan_ids
 
     # --- Query methods ---
 

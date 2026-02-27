@@ -176,6 +176,21 @@ class TestRegimeSuggestion:
         assert snap.suggested_regime is None
 
 
+class TestForceRiskPause:
+    def test_force_risk_pause(self) -> None:
+        rm = RiskManager(initial_portfolio_usd=Decimal("10000"))
+        assert rm.pause_state == PauseState.ACTIVE_TRADING
+        rm.force_risk_pause()
+        assert rm.pause_state == PauseState.RISK_PAUSE_ACTIVE
+        assert rm.risk_pauses == 1
+
+    def test_force_risk_pause_idempotent(self) -> None:
+        rm = RiskManager(initial_portfolio_usd=Decimal("10000"))
+        rm.force_risk_pause()
+        rm.force_risk_pause()
+        assert rm.risk_pauses == 1  # Only counted once
+
+
 class TestForceActive:
     def test_force_active_resets(self) -> None:
         rm = RiskManager(initial_portfolio_usd=Decimal("10000"))

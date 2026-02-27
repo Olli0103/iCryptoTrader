@@ -264,17 +264,30 @@ class StrategyLoop:
                     exchange_trade_id=trade_id,
                 )
             except ValueError:
-                logger.exception("FIFO sell failed — ledger mismatch")
+                logger.exception(
+                    "FIFO sell failed — ledger mismatch, triggering risk pause. "
+                    "fill_qty=%s fill_price=%s order_id=%s",
+                    fill_qty, fill_price, order_id,
+                )
+                self._risk.force_risk_pause()
 
     def _dispatch_action(
         self, slot: Any, action: Any, slot_index: int,
     ) -> dict[str, Any] | None:
-        """Convert an Action into a command dict for WS2 dispatch."""
+        """Convert an Action into a command dict for WS2 dispatch.
+
+        Checks the rate limiter before dispatching add/amend commands.
+        Cancels are never throttled (Kraken always accepts them).
+        """
         if isinstance(action, Action.AddOrder):
+            if self._om._rate_limiter.should_throttle("add_order"):
+                return None
             params = self._om.prepare_add(slot, action)
             return {"type": "add", "slot_id": slot_index, "params": params}
 
         if isinstance(action, Action.AmendOrder):
+            if self._om._rate_limiter.should_throttle("amend_order"):
+                return None
             params = self._om.prepare_amend(slot, action)
             return {"type": "amend", "slot_id": slot_index, "params": params}
 

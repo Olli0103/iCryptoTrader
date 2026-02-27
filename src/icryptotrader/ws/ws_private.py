@@ -303,7 +303,11 @@ class WSPrivate:
             await asyncio.sleep(self._heartbeat_interval_sec)
 
     async def _get_ws_token(self) -> str:
-        """Obtain a WebSocket auth token via REST GetWebSocketsToken."""
+        """Obtain a WebSocket auth token via REST GetWebSocketsToken.
+
+        Retries transient network errors up to 3 times with exponential
+        backoff.  Auth errors (4xx) are raised immediately.
+        """
         if not self._api_key:
             # For testing without real credentials
             logger.warning("WS2 no API key configured, using empty token")
@@ -314,34 +318,63 @@ class WSPrivate:
         import hmac
         import urllib.parse
 
-        nonce = str(int(time.time() * 1000))
-        data = {"nonce": nonce}
-        url_path = "/0/private/GetWebSocketsToken"
+        max_attempts = 4
+        last_exc: Exception | None = None
 
-        post_data = urllib.parse.urlencode(data)
-        encoded = (nonce + post_data).encode()
-        message = url_path.encode() + hashlib.sha256(encoded).digest()
-        signature = hmac.new(
-            base64.b64decode(self._api_secret), message, hashlib.sha512
-        )
-        sig_b64 = base64.b64encode(signature.digest()).decode()
+        for attempt in range(max_attempts):
+            nonce = str(int(time.time() * 1000))
+            data = {"nonce": nonce}
+            url_path = "/0/private/GetWebSocketsToken"
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self._rest_url}{url_path}",
-                data=data,
-                headers={
-                    "API-Key": self._api_key,
-                    "API-Sign": sig_b64,
-                },
+            post_data = urllib.parse.urlencode(data)
+            encoded = (nonce + post_data).encode()
+            message = url_path.encode() + hashlib.sha256(encoded).digest()
+            signature = hmac.new(
+                base64.b64decode(self._api_secret), message, hashlib.sha512
             )
-            resp.raise_for_status()
-            result = resp.json()
+            sig_b64 = base64.b64encode(signature.digest()).decode()
 
-        if result.get("error"):
-            raise WSPrivateError(f"GetWebSocketsToken failed: {result['error']}")
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{self._rest_url}{url_path}",
+                        data=data,
+                        headers={
+                            "API-Key": self._api_key,
+                            "API-Sign": sig_b64,
+                        },
+                        timeout=10.0,
+                    )
+                    # Auth errors (4xx) should not be retried
+                    if 400 <= resp.status_code < 500:
+                        resp.raise_for_status()
+                    resp.raise_for_status()
+                    result = resp.json()
 
-        return result["result"]["token"]
+                if result.get("error"):
+                    raise WSPrivateError(
+                        f"GetWebSocketsToken failed: {result['error']}"
+                    )
+
+                return result["result"]["token"]
+
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code < 500:
+                    raise  # Auth error — don't retry
+                last_exc = e
+            except (httpx.TransportError, OSError, TimeoutError) as e:
+                last_exc = e
+
+            backoff = 2 ** attempt
+            logger.warning(
+                "WS2 token request failed (attempt %d/%d): %s — retrying in %ds",
+                attempt + 1, max_attempts, last_exc, backoff,
+            )
+            await asyncio.sleep(backoff)
+
+        raise WSPrivateError(
+            f"GetWebSocketsToken failed after {max_attempts} attempts: {last_exc}"
+        )
 
     def _dispatch(self, msg: WSMessage) -> None:
         """Route messages to appropriate callbacks."""
