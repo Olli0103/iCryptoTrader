@@ -113,6 +113,8 @@ class GridEngine:
         num_buy_levels: int = 5,
         num_sell_levels: int = 5,
         spacing_bps: Decimal | None = None,
+        buy_spacing_bps: Decimal | None = None,
+        sell_spacing_bps: Decimal | None = None,
         buy_qty_scale: Decimal = Decimal("1"),
         sell_qty_scale: Decimal = Decimal("1"),
     ) -> GridState:
@@ -122,7 +124,10 @@ class GridEngine:
             mid_price: Current mid-price (or reference price).
             num_buy_levels: Number of buy levels below mid.
             num_sell_levels: Number of sell levels above mid.
-            spacing_bps: Override spacing (None = auto from fee model).
+            spacing_bps: Base spacing (None = auto from fee model).
+                Used for both sides unless overridden by buy/sell_spacing_bps.
+            buy_spacing_bps: Override spacing for buy levels (from delta skew).
+            sell_spacing_bps: Override spacing for sell levels (from delta skew).
             buy_qty_scale: Multiplier for buy quantities (for asymmetric grids).
             sell_qty_scale: Multiplier for sell quantities.
 
@@ -130,14 +135,17 @@ class GridEngine:
             GridState with computed levels.
         """
         self.ticks += 1
-        spacing = spacing_bps if spacing_bps is not None else self.optimal_spacing_bps()
-        spacing_factor = spacing / Decimal("10000")
+        base_spacing = spacing_bps if spacing_bps is not None else self.optimal_spacing_bps()
+        buy_spacing = buy_spacing_bps if buy_spacing_bps is not None else base_spacing
+        sell_spacing = sell_spacing_bps if sell_spacing_bps is not None else base_spacing
+        buy_factor = buy_spacing / Decimal("10000")
+        sell_factor = sell_spacing / Decimal("10000")
 
         buy_levels: list[GridLevel] = []
         sell_levels: list[GridLevel] = []
 
         for i in range(num_buy_levels):
-            offset = (i + 1) * spacing_factor
+            offset = (i + 1) * buy_factor
             price = (mid_price * (1 - offset)).quantize(
                 Decimal("0.1"), rounding=ROUND_HALF_UP,
             )
@@ -148,7 +156,7 @@ class GridEngine:
                 ))
 
         for i in range(num_sell_levels):
-            offset = (i + 1) * spacing_factor
+            offset = (i + 1) * sell_factor
             price = (mid_price * (1 + offset)).quantize(
                 Decimal("0.1"), rounding=ROUND_HALF_UP,
             )
@@ -160,7 +168,7 @@ class GridEngine:
 
         self._state = GridState(
             mid_price=mid_price,
-            spacing_bps=spacing,
+            spacing_bps=base_spacing,
             buy_levels=buy_levels,
             sell_levels=sell_levels,
             total_levels=len(buy_levels) + len(sell_levels),

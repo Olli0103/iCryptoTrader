@@ -133,6 +133,9 @@ class OrderManager:
         self._cl_ord_id_to_slot: dict[str, OrderSlot] = {}
         self._req_id_to_slot: dict[int, OrderSlot] = {}
 
+        # req_id counter (offset from WS req_ids to avoid collisions)
+        self._req_id_counter = 2000
+
         # Fill callback (called on every fill for FIFO ledger integration)
         self._on_fill: list[Any] = []
 
@@ -212,17 +215,32 @@ class OrderManager:
 
     # --- Command execution (called by strategy after decide_action) ---
 
+    def _next_req_id(self) -> int:
+        self._req_id_counter += 1
+        return self._req_id_counter
+
     def prepare_add(self, slot: OrderSlot, action: Action.AddOrder) -> dict[str, Any]:
-        """Prepare an add_order command. Returns kwargs for WS2.send_add_order."""
+        """Prepare an add_order command. Returns kwargs for WS2.send_add_order.
+
+        Generates a ``req_id`` and registers it in ``_req_id_to_slot`` so that
+        ``on_add_order_ack`` can route the response back to this slot.  The
+        ``req_id`` is included in the returned params dict; callers that forward
+        to ``WSPrivate.send_add_order`` should pass it through.
+        """
         cl_ord_id = str(uuid.uuid4())
+        req_id = self._next_req_id()
+
         slot.state = SlotState.PENDING_NEW
         slot.pending_since = time.monotonic()
         slot.cl_ord_id = cl_ord_id
+        slot.pending_req_id = req_id
         slot.side = action.side
         slot.price = action.price
         slot.qty = action.qty
         slot.filled_qty = Decimal("0")
+
         self._cl_ord_id_to_slot[cl_ord_id] = slot
+        self._req_id_to_slot[req_id] = slot
         self.orders_placed += 1
         self._rate_limiter.record_send(COST_ADD_ORDER)
 
@@ -234,6 +252,7 @@ class OrderManager:
             "quantity": str(action.qty),
             "cl_ord_id": cl_ord_id,
             "post_only": True,
+            "req_id": req_id,
         }
 
     def prepare_amend(self, slot: OrderSlot, action: Action.AmendOrder) -> dict[str, Any]:

@@ -149,6 +149,18 @@ class TestPrepareCommands:
         assert cmd["post_only"] is True
         assert om.orders_placed == 1
 
+    def test_prepare_add_populates_req_id(self) -> None:
+        """req_id must be generated, stored on slot, in _req_id_to_slot, and in params."""
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        action = Action.AddOrder(Decimal("85000"), Decimal("0.01"), Side.BUY)
+        cmd = om.prepare_add(slot, action)
+
+        req_id = cmd["req_id"]
+        assert req_id > 0
+        assert slot.pending_req_id == req_id
+        assert om._req_id_to_slot[req_id] is slot
+
     def test_prepare_amend(self) -> None:
         om = OrderManager(num_slots=1)
         slot = om.slots[0]
@@ -176,6 +188,20 @@ class TestPrepareCommands:
 
 
 class TestExecutionEvents:
+    def test_add_order_ack_routed_via_req_id_from_prepare(self) -> None:
+        """End-to-end: prepare_add generates req_id, on_add_order_ack routes via it."""
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        action = Action.AddOrder(Decimal("85000"), Decimal("0.01"), Side.BUY)
+        cmd = om.prepare_add(slot, action)
+        req_id = cmd["req_id"]
+
+        om.on_add_order_ack(req_id=req_id, order_id="O123", success=True)
+        assert slot.state == SlotState.LIVE
+        assert slot.order_id == "O123"
+        # req_id should be consumed from the map
+        assert req_id not in om._req_id_to_slot
+
     def test_add_order_ack_success(self) -> None:
         om = OrderManager(num_slots=1)
         slot = om.slots[0]

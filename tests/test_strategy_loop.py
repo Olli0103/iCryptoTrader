@@ -238,6 +238,65 @@ class TestRiskPause:
         assert loop.ticks_skipped_risk >= 1
 
 
+class TestDeltaSkewApplied:
+    def test_skew_affects_grid_prices(self) -> None:
+        """When BTC allocation deviates from target, buy/sell spacing should differ."""
+        fee_model = FeeModel(volume_30d_usd=0)
+        ledger = FIFOLedger()
+        om_sym = OrderManager(num_slots=10)
+        om_skew = OrderManager(num_slots=10)
+        grid_sym = GridEngine(fee_model=fee_model)
+        grid_skew = GridEngine(fee_model=fee_model)
+        tax_agent = TaxAgent(ledger=ledger)
+        risk_mgr_sym = RiskManager(initial_portfolio_usd=Decimal("5000"))
+        risk_mgr_skew = RiskManager(initial_portfolio_usd=Decimal("5000"))
+        regime_sym = RegimeRouter()
+        regime_skew = RegimeRouter()
+
+        # Symmetric: balanced allocation (50/50)
+        inv_sym = InventoryArbiter()
+        inv_sym.update_balances(btc=Decimal("0.03"), usd=Decimal("2550"))
+        inv_sym.update_price(Decimal("85000"))
+
+        skew_zero = DeltaSkew(sensitivity=Decimal("2.0"))
+        loop_sym = StrategyLoop(
+            fee_model=fee_model, order_manager=om_sym, grid_engine=grid_sym,
+            tax_agent=tax_agent, risk_manager=risk_mgr_sym, delta_skew=skew_zero,
+            inventory=inv_sym, regime_router=regime_sym, ledger=ledger,
+        )
+
+        # Skewed: heavily over-allocated to BTC (90% BTC)
+        inv_skew = InventoryArbiter()
+        inv_skew.update_balances(btc=Decimal("0.10"), usd=Decimal("500"))
+        inv_skew.update_price(Decimal("85000"))
+
+        skew_high = DeltaSkew(sensitivity=Decimal("2.0"))
+        loop_skew = StrategyLoop(
+            fee_model=fee_model, order_manager=om_skew, grid_engine=grid_skew,
+            tax_agent=tax_agent, risk_manager=risk_mgr_skew, delta_skew=skew_high,
+            inventory=inv_skew, regime_router=regime_skew, ledger=ledger,
+        )
+
+        cmds_sym = loop_sym.tick(mid_price=Decimal("85000"))
+        cmds_skew = loop_skew.tick(mid_price=Decimal("85000"))
+
+        # Extract buy prices from both
+        buy_prices_sym = sorted(
+            Decimal(c["params"]["price"]) for c in cmds_sym
+            if c["type"] == "add" and c["params"]["side"] == "buy"
+        )
+        buy_prices_skew = sorted(
+            Decimal(c["params"]["price"]) for c in cmds_skew
+            if c["type"] == "add" and c["params"]["side"] == "buy"
+        )
+
+        # With high BTC allocation, skew should widen buy spacing (lower prices)
+        if buy_prices_sym and buy_prices_skew:
+            assert buy_prices_skew[0] < buy_prices_sym[0], (
+                "Over-allocated BTC should widen buy levels (push further from mid)"
+            )
+
+
 class TestFillHandling:
     def test_buy_fill_adds_lot(self) -> None:
         loop = _make_loop()

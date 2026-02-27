@@ -173,15 +173,18 @@ class WSPrivate:
         quantity: str | None = None,
         cl_ord_id: str | None = None,
         post_only: bool = False,
-    ) -> int:
-        """Send add_order command. Returns req_id for correlation."""
-        req_id = self.next_req_id()
+        req_id: int | None = None,
+    ) -> int | None:
+        """Send add_order command. Returns req_id, or None if send failed."""
+        if req_id is None:
+            req_id = self.next_req_id()
         frame = ws_codec.encode_add_order(
             order_type, side, pair,
             price=price, quantity=quantity, cl_ord_id=cl_ord_id,
             post_only=post_only, req_id=req_id,
         )
-        await self.send(frame)
+        if not await self.send(frame):
+            return None
         return req_id
 
     async def send_amend_order(
@@ -190,34 +193,41 @@ class WSPrivate:
         *,
         new_price: str | None = None,
         new_qty: str | None = None,
-    ) -> int:
-        """Send amend_order command (atomic). Returns req_id."""
+    ) -> int | None:
+        """Send amend_order command (atomic). Returns req_id, or None if send failed."""
         req_id = self.next_req_id()
         frame = ws_codec.encode_amend_order(
             order_id, new_price=new_price, new_qty=new_qty, req_id=req_id,
         )
-        await self.send(frame)
+        if not await self.send(frame):
+            return None
         return req_id
 
-    async def send_cancel_order(self, order_id: str | list[str]) -> int:
-        """Send cancel_order command. Returns req_id."""
+    async def send_cancel_order(self, order_id: str | list[str]) -> int | None:
+        """Send cancel_order command. Returns req_id, or None if send failed."""
         req_id = self.next_req_id()
         frame = ws_codec.encode_cancel_order(order_id, req_id=req_id)
-        await self.send(frame)
+        if not await self.send(frame):
+            return None
         return req_id
 
-    async def send_cancel_all(self) -> int:
-        """Send cancel_all command. Returns req_id."""
+    async def send_cancel_all(self) -> int | None:
+        """Send cancel_all command. Returns req_id, or None if send failed."""
         req_id = self.next_req_id()
         frame = ws_codec.encode_cancel_all(req_id=req_id)
-        await self.send(frame)
+        if not await self.send(frame):
+            return None
         return req_id
 
-    async def send_cancel_after(self, timeout_sec: int) -> int:
-        """Send cancel_after (dead man's switch). timeout=0 disarms."""
+    async def send_cancel_after(self, timeout_sec: int) -> int | None:
+        """Send cancel_after (dead man's switch). timeout=0 disarms.
+
+        Returns req_id, or None if send failed.
+        """
         req_id = self.next_req_id()
         frame = ws_codec.encode_cancel_after(timeout_sec, req_id=req_id)
-        await self.send(frame)
+        if not await self.send(frame):
+            return None
         return req_id
 
     # --- Internal connection lifecycle ---

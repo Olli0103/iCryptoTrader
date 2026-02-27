@@ -170,18 +170,17 @@ class StrategyLoop:
             target_pct=limits.target_pct,
         )
 
-        # 8. Compute grid levels
+        # 8. Compute grid levels with skewed spacings
         base_spacing = self._grid.optimal_spacing_bps()
         buy_spacing, sell_spacing = self._skew.apply_to_spacing(base_spacing, skew_result)
 
-        # Use average spacing for grid computation, apply skew via qty scaling
         self._grid.compute_grid(
             mid_price=mid_price,
             num_buy_levels=num_buy,
             num_sell_levels=num_sell,
             spacing_bps=base_spacing,
-            buy_qty_scale=Decimal("1"),
-            sell_qty_scale=Decimal("1"),
+            buy_spacing_bps=buy_spacing,
+            sell_spacing_bps=sell_spacing,
         )
 
         # Deactivate sell levels if tax-locked

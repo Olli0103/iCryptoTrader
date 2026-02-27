@@ -110,6 +110,42 @@ class TestComputeGrid:
         assert engine.ticks == 2
 
 
+class TestAsymmetricSpacing:
+    def test_buy_sell_spacing_overrides(self) -> None:
+        """buy_spacing_bps and sell_spacing_bps produce asymmetric grids."""
+        fm = FeeModel(volume_30d_usd=0)
+        engine = GridEngine(fee_model=fm)
+        state = engine.compute_grid(
+            mid_price=Decimal("100000"),
+            num_buy_levels=1,
+            num_sell_levels=1,
+            spacing_bps=Decimal("100"),
+            buy_spacing_bps=Decimal("200"),  # 2% for buys
+            sell_spacing_bps=Decimal("50"),   # 0.5% for sells
+        )
+        # Buy: 100000 * (1 - 0.02) = 98000
+        assert state.buy_levels[0].price == Decimal("98000.0")
+        # Sell: 100000 * (1 + 0.005) = 100500
+        assert state.sell_levels[0].price == Decimal("100500.0")
+        # base spacing stored as the base value
+        assert state.spacing_bps == Decimal("100")
+
+    def test_only_buy_spacing_override(self) -> None:
+        """When only buy_spacing_bps is set, sell uses base spacing."""
+        fm = FeeModel(volume_30d_usd=0)
+        engine = GridEngine(fee_model=fm)
+        state = engine.compute_grid(
+            mid_price=Decimal("100000"),
+            num_buy_levels=1,
+            num_sell_levels=1,
+            spacing_bps=Decimal("100"),
+            buy_spacing_bps=Decimal("200"),
+        )
+        assert state.buy_levels[0].price == Decimal("98000.0")
+        # Sell uses base_spacing (100 bps = 1%)
+        assert state.sell_levels[0].price == Decimal("101000.0")
+
+
 class TestDesiredLevels:
     def test_maps_to_desired_level(self) -> None:
         fm = FeeModel(volume_30d_usd=0)
