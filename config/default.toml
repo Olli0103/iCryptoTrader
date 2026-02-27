@@ -1,0 +1,73 @@
+pair = "XBT/USD"
+log_level = "INFO"
+data_dir = "data"
+
+[kraken]
+api_key = ""
+api_secret = ""
+ws_public_url = "wss://ws.kraken.com/v2"
+ws_private_url = "wss://ws-auth.kraken.com/v2"
+rest_url = "https://api.kraken.com"
+
+[grid]
+levels = 5
+order_size_usd = "500"
+min_spacing_bps = "20"
+post_only = true
+
+[risk]
+max_portfolio_drawdown_pct = 0.15
+emergency_drawdown_pct = 0.20
+price_velocity_freeze_pct = 0.03
+price_velocity_window_sec = 60
+price_velocity_cooldown_sec = 30
+
+[tax]
+holding_period_days = 365
+near_threshold_days = 330
+annual_exemption_eur = "1000"
+emergency_dd_override_pct = 0.20
+
+[regime.range_bound]
+btc_target_pct = 0.50
+btc_max_pct = 0.60
+btc_min_pct = 0.40
+grid_levels = 5
+signal_enabled = true
+
+[regime.trending_up]
+btc_target_pct = 0.70
+btc_max_pct = 0.80
+btc_min_pct = 0.55
+grid_levels = 3
+signal_enabled = true
+
+[regime.trending_down]
+btc_target_pct = 0.30
+btc_max_pct = 0.40
+btc_min_pct = 0.15
+grid_levels = 3
+signal_enabled = true
+
+[regime.chaos]
+btc_target_pct = 0.00
+btc_max_pct = 0.05
+btc_min_pct = 0.00
+grid_levels = 0
+signal_enabled = false
+
+[ws]
+cancel_after_timeout_sec = 60
+heartbeat_interval_sec = 20
+reconnect_max_backoff_sec = 30
+pending_ack_timeout_ms = 500
+
+[rate_limit]
+max_counter = 180
+decay_rate = 3.75
+headroom_pct = 0.80
+
+[telegram]
+enabled = false
+bot_token = ""
+chat_id = ""
