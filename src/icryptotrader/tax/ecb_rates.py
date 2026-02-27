@@ -27,9 +27,8 @@ class ECBRateError(Exception):
 class ECBRateService:
     """Fetches and caches daily ECB EUR/USD reference rates.
 
-    The rate returned is EUR per 1 USD (e.g., 0.92 means 1 USD = 0.92 EUR).
-    For tax calculations: USD_amount / rate = EUR_amount
-    (because the ECB quotes USD price of 1 EUR, we invert).
+    The rate returned is USD per 1 EUR (e.g., 1.08 means 1 EUR = 1.08 USD).
+    For tax calculations: USD_amount / rate = EUR_amount.
     """
 
     def __init__(self, http_client: httpx.Client | None = None) -> None:
@@ -49,8 +48,8 @@ class ECBRateService:
         if for_date in self._cache:
             return self._cache[for_date]
 
-        # Walk back up to 5 days to find the most recent business day
-        check_date = for_date
+        # Walk back up to 5 business days to find a cached rate
+        check_date = for_date - timedelta(days=1)
         for _ in range(5):
             if check_date in self._cache:
                 self._cache[for_date] = self._cache[check_date]

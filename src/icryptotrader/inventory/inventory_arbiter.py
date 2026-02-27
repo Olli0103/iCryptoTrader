@@ -196,8 +196,8 @@ class InventoryArbiter:
             return Decimal("0")
 
         # Cap to single-tick rebalance limit
-        effective_pct = min(headroom_pct, self._max_rebalance_pct)
-        max_usd = total_usd * Decimal(str(effective_pct))
+        effective_pct = Decimal(str(min(headroom_pct, self._max_rebalance_pct)))
+        max_usd = total_usd * effective_pct
 
         # Also cap to available USD
         max_usd = min(max_usd, self._usd_balance)
@@ -215,7 +215,7 @@ class InventoryArbiter:
         if excess_pct <= 0:
             return Decimal("0")
 
-        effective_pct = min(excess_pct, self._max_rebalance_pct)
-        max_usd = total_usd * Decimal(str(effective_pct))
+        effective_pct = Decimal(str(min(excess_pct, self._max_rebalance_pct)))
+        max_usd = total_usd * effective_pct
 
         return min(max_usd / self._btc_price, self._btc_balance)

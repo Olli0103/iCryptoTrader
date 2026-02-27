@@ -529,3 +529,4 @@ class OrderManager:
         slot.cl_ord_id = ""
         slot.pending_req_id = 0
         slot.filled_qty = Decimal("0")
+        slot.desired = None

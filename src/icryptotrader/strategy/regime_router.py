@@ -105,7 +105,7 @@ class RegimeRouter:
 
     @property
     def ewma_volatility(self) -> float:
-        """Annualized EWMA volatility estimate."""
+        """EWMA volatility estimate (tick-level, not annualized)."""
         return self._ewma_var ** 0.5
 
     def update_price(self, price: Decimal) -> None:

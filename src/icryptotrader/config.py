@@ -45,7 +45,6 @@ class TaxConfig:
     near_threshold_days: int = 330
     annual_exemption_eur: Decimal = Decimal("1000")
     emergency_dd_override_pct: float = 0.20
-    ecb_rate_url: str = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A"
 
 
 @dataclass

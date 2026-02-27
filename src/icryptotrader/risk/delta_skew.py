@@ -81,7 +81,7 @@ class DeltaSkew:
 
         # Convert deviation to bps using sensitivity multiplier
         # deviation of 0.10 (10%) with sensitivity 2.0 = 20 bps skew
-        raw_skew_bps = Decimal(str(deviation * 100)) * self._sensitivity
+        raw_skew_bps = Decimal(str(deviation)) * Decimal("100") * self._sensitivity
 
         # Clamp to max
         clamped = max(-self._max_skew_bps, min(self._max_skew_bps, raw_skew_bps))

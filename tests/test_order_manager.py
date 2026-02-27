@@ -266,6 +266,7 @@ class TestExecutionEvents:
         slot.qty = Decimal("0.01")
         slot.side = Side.BUY
         slot.price = Decimal("85000")
+        slot.desired = _desired("85000", "0.01")
         om._order_id_to_slot["O123"] = slot
 
         fills_received: list = []
@@ -280,6 +281,7 @@ class TestExecutionEvents:
         assert slot.state == SlotState.EMPTY
         assert om.orders_filled == 1
         assert len(fills_received) == 1
+        assert slot.desired is None  # Stale desired must be cleared
 
     def test_partial_fill_stays_live(self) -> None:
         om = OrderManager(num_slots=1)
