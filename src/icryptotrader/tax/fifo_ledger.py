@@ -296,6 +296,39 @@ class FIFOLedger:
     def open_lots(self) -> list[TaxLot]:
         return [lot for lot in self._lots if lot.status != LotStatus.CLOSED]
 
+    def underwater_lots(
+        self,
+        current_price_usd: Decimal,
+        eur_usd_rate: Decimal,
+        near_threshold_days: int = 330,
+    ) -> list[tuple[TaxLot, Decimal]]:
+        """Return open lots with unrealized losses, sorted by loss magnitude.
+
+        Returns list of (lot, estimated_loss_eur) where loss_eur < 0.
+        Excludes:
+        - Closed lots
+        - Tax-free lots (selling at a loss has no tax benefit)
+        - Lots within near_threshold_days of maturity (protect for Haltefrist)
+        """
+        results: list[tuple[TaxLot, Decimal]] = []
+        for lot in self._lots:
+            if lot.status == LotStatus.CLOSED:
+                continue
+            if lot.is_tax_free:
+                continue
+            if lot.days_held >= near_threshold_days:
+                continue
+
+            current_value_eur = (lot.remaining_qty_btc * current_price_usd) / eur_usd_rate
+            cost_basis_eur = (lot.remaining_qty_btc / lot.quantity_btc) * lot.purchase_total_eur
+            unrealized_pnl = current_value_eur - cost_basis_eur
+
+            if unrealized_pnl < 0:
+                results.append((lot, unrealized_pnl))
+
+        results.sort(key=lambda x: x[1])  # Most negative first
+        return results
+
     def all_disposals(self, year: int | None = None) -> list[Disposal]:
         """All disposals, optionally filtered by tax year."""
         disposals: list[Disposal] = []

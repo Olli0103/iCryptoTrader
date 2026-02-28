@@ -80,6 +80,19 @@ class Pair:
 BTC_USD = Pair(base="XBT", quote="USD")
 
 
+@dataclass
+class HarvestRecommendation:
+    """Recommendation to sell a losing lot for tax optimization."""
+
+    lot_id: str
+    qty_btc: Decimal
+    estimated_loss_eur: Decimal
+    current_price_usd: Decimal
+    cost_basis_per_btc_eur: Decimal
+    days_held: int
+    reason: str  # e.g., "offset_gains", "freigrenze_optimization"
+
+
 @dataclass(frozen=True)
 class FeeTier:
     """A single fee tier with volume threshold and rates."""

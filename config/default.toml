@@ -28,6 +28,10 @@ holding_period_days = 365
 near_threshold_days = 330
 annual_exemption_eur = "1000"
 emergency_dd_override_pct = 0.20
+harvest_enabled = false
+harvest_min_loss_eur = "50"
+harvest_max_per_day = 3
+harvest_target_net_eur = "800"
 
 [regime.range_bound]
 btc_target_pct = 0.50

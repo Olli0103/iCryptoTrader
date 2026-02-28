@@ -362,6 +362,149 @@ class TestPersistence:
         assert len(ledger.lots) == 0
 
 
+class TestUnderwaterLots:
+    """Tests for underwater_lots() used in tax-loss harvesting."""
+
+    def test_identifies_losing_positions(self) -> None:
+        """Lots bought at higher price than current should appear."""
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(100),
+        )
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+        )
+        assert len(results) == 1
+        lot, loss = results[0]
+        assert lot.purchase_price_usd == Decimal("90000")
+        assert loss < Decimal("0")
+
+    def test_excludes_profitable_lots(self) -> None:
+        """Lots bought at lower price than current should not appear."""
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("70000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(100),
+        )
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+        )
+        assert len(results) == 0
+
+    def test_excludes_tax_free_lots(self) -> None:
+        """Tax-free lots (>365 days) should not appear — no tax benefit from loss."""
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(400),  # >365 days, tax-free
+        )
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+        )
+        assert len(results) == 0
+
+    def test_excludes_near_threshold_lots(self) -> None:
+        """Lots near maturity (>=330 days) should be protected."""
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(340),  # 340 days, near threshold
+        )
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+            near_threshold_days=330,
+        )
+        assert len(results) == 0
+
+    def test_excludes_closed_lots(self) -> None:
+        """Closed lots should not appear."""
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(100),
+        )
+        # Sell it fully to close the lot
+        ledger.sell_fifo(
+            quantity_btc=Decimal("0.01"), sale_price_usd=Decimal("80000"),
+            sale_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        )
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+        )
+        assert len(results) == 0
+
+    def test_sorted_by_loss_magnitude(self) -> None:
+        """Results should be sorted by loss, most negative first."""
+        ledger = FIFOLedger()
+        # Small loss lot
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("82000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(100),
+        )
+        # Large loss lot
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("95000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(50),
+        )
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+        )
+        assert len(results) == 2
+        # Most negative loss first (the $95k lot)
+        assert results[0][1] < results[1][1]
+
+    def test_mixed_lots_filters_correctly(self) -> None:
+        """Mix of profitable, losing, tax-free, and near-threshold lots."""
+        ledger = FIFOLedger()
+        now = datetime.now(UTC)
+        # Losing + eligible (100 days old, bought at $90k)
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=100),
+        )
+        # Profitable (100 days old, bought at $70k)
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("70000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=100),
+        )
+        # Losing but tax-free (400 days old)
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=400),
+        )
+        # Losing but near threshold (340 days old)
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=340),
+        )
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+        )
+        # Only the first lot (losing + eligible) should appear
+        assert len(results) == 1
+        assert results[0][0].purchase_price_usd == Decimal("90000")
+        assert results[0][0].days_held < 330
+
+    def test_empty_ledger(self) -> None:
+        ledger = FIFOLedger()
+        results = ledger.underwater_lots(
+            current_price_usd=Decimal("80000"), eur_usd_rate=EUR_USD,
+        )
+        assert results == []
+
+
 class TestTaxableGainYTD:
     def test_accumulates_taxable_gains(self) -> None:
         ledger = FIFOLedger()

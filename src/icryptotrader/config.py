@@ -45,6 +45,10 @@ class TaxConfig:
     near_threshold_days: int = 330
     annual_exemption_eur: Decimal = Decimal("1000")
     emergency_dd_override_pct: float = 0.20
+    harvest_enabled: bool = False
+    harvest_min_loss_eur: Decimal = Decimal("50")
+    harvest_max_per_day: int = 3
+    harvest_target_net_eur: Decimal = Decimal("800")
 
 
 @dataclass
