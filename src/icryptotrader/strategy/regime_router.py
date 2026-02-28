@@ -89,6 +89,10 @@ class RegimeRouter:
         # Price history for momentum
         self._price_history: deque[tuple[float, Decimal]] = deque(maxlen=momentum_window)
 
+        # VWAP tracking
+        self._trade_history: deque[tuple[Decimal, Decimal]] = deque(maxlen=500)
+        self._vwap_value: Decimal | None = None
+
         # External signals
         self._obi: float = 0.0
         self._toxicity: float = 0.0
@@ -134,6 +138,20 @@ class RegimeRouter:
     def update_flow_toxicity(self, toxicity: float) -> None:
         """Update flow toxicity signal. Range: 0 to 1."""
         self._toxicity = max(0.0, min(1.0, toxicity))
+
+    def update_trade(self, price: Decimal, quantity: Decimal) -> None:
+        """Record a trade for VWAP calculation."""
+        self._trade_history.append((price, quantity))
+        # Recompute VWAP
+        total_pq = sum(p * q for p, q in self._trade_history)
+        total_q = sum(q for _, q in self._trade_history)
+        if total_q > 0:
+            self._vwap_value = total_pq / total_q
+
+    @property
+    def vwap(self) -> Decimal | None:
+        """Volume-weighted average price from recent trades. None if no trades."""
+        return self._vwap_value
 
     def classify(self) -> RegimeDecision:
         """Classify current market regime based on all signals.

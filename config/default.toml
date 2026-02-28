@@ -88,3 +88,19 @@ max_spacing_bps = "200"
 enabled = false
 bot_token = ""
 chat_id = ""
+
+[ai_signal]
+enabled = false
+provider = "gemini"        # "gemini", "anthropic", "openai"
+api_key = ""
+model = "gemini-2.0-flash"
+temperature = 0.2
+max_tokens = 512
+cooldown_sec = 300         # Min seconds between AI calls
+weight = 0.3               # Signal weight vs grid (0.0-1.0)
+timeout_sec = 10
+
+[metrics]
+enabled = false
+port = 9090
+prefix = "icryptotrader"

@@ -7,6 +7,7 @@ Lots held >365 days are tax-free (Haltefrist überschritten).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import uuid
@@ -350,15 +351,32 @@ class FIFOLedger:
     # --- Persistence ---
 
     def save(self, path: Path) -> None:
-        """Save ledger to JSON file."""
-        data = []
-        for lot in self._lots:
-            lot_dict = _lot_to_dict(lot)
-            data.append(lot_dict)
+        """Save ledger to JSON file using atomic write (temp + rename + fsync).
+
+        Prevents data loss if the process crashes during write. The rename
+        operation is atomic on POSIX filesystems, so readers always see
+        either the old or new file — never a partial write.
+        """
+        import os
+        import tempfile
+
+        data = [_lot_to_dict(lot) for lot in self._lots]
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        logger.info("FIFO ledger saved to %s (%d lots)", path, len(data))
+
+        # Write to temp file in the same directory, then atomic rename
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+            logger.info("FIFO ledger saved to %s (%d lots)", path, len(data))
+        except BaseException:
+            # Clean up temp file on any failure
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
     def load(self, path: Path) -> None:
         """Load ledger from JSON file."""

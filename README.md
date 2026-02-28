@@ -7,10 +7,14 @@ Runs a mean-reversion grid strategy on Kraken's WebSocket v2 API, with every buy
 ## Key Features
 
 - **Grid Trading Engine** — Symmetric buy/sell grid with fee-aware spacing auto-calibration
+- **AI Signal Engine** — Multi-provider LLM signals (Gemini, Anthropic, OpenAI) for directional bias alongside the grid
 - **Bollinger Band Spacing** — Volatility-adaptive grid density using rolling Bollinger Bands
+- **VWAP Mid-Price** — Volume-weighted average price from recent trades for stable grid centering
 - **FIFO Tax Ledger** — Per-lot tracking with cost basis in USD and EUR, §23 EStG Haltefrist enforcement
+- **Atomic Ledger Persistence** — Crash-safe writes using temp file + atomic rename + fsync
 - **Tax Agent Veto** — Blocks taxable sells, allows tax-free lots, respects the annual Freigrenze (EUR 1,000)
 - **Tax-Loss Harvesting** — Proactive selling of underwater lots to offset gains and optimize Freigrenze
+- **Annual Tax Report Automation** — Auto-generate Anlage SO (CSV/JSON) at year-end
 - **Delta Skew** — Asymmetric grid spacing based on inventory deviation from target allocation
 - **Risk Manager** — Drawdown classification (Healthy/Warning/Problem/Critical/Emergency), pause state machine, price velocity circuit breaker with hysteresis
 - **Regime Router** — EWMA volatility + momentum-based regime classification (Range-bound, Trending Up/Down, Chaos)
@@ -20,8 +24,8 @@ Runs a mean-reversion grid strategy on Kraken's WebSocket v2 API, with every buy
 - **Dead Man's Switch** — `cancel_after` heartbeat automatically cancels all orders if the bot disconnects
 - **Telegram Notifications** — Fill alerts, risk state changes, tax unlock countdowns, daily P&L summaries
 - **ECB Rate Service** — Daily EUR/USD reference rates from the ECB for Finanzamt-accepted tax calculations
-- **Tax Report Generator** — Anlage SO export in CSV and JSON with per-disposal fields
-- **Auto-Save Ledger** — FIFO ledger persisted to disk after every fill for crash safety
+- **Config Validation** — Startup validation catches misconfigured values before trading begins
+- **Structured Metrics** — Prometheus-compatible metrics export (counters, gauges, histograms) via built-in HTTP server
 - **Graceful Shutdown** — SIGTERM/SIGINT handler: cancel all orders, disarm DMS, save ledger, close connections
 - **Startup Reconciliation** — Load ledger, reconnect, reconcile order slots against exchange snapshots, cancel orphans
 - **Dynamic Grid Sizing** — Per-regime `order_size_scale` adjusts order notional (1.0x range-bound, 0.75x trending, 0.5x chaos)
@@ -54,14 +58,14 @@ Runs a mean-reversion grid strategy on Kraken's WebSocket v2 API, with every buy
                |   (orchestrator) |
                +--------+---------+
                         |
-         +--------------+--------------+
-         |        |        |           |
-    +----v---+ +--v---+ +--v------+ +--v---------+
-    | Regime | | Grid | | Delta   | | Inventory  |
-    | Router | | Eng. | | Skew    | | Arbiter    |
-    +--------+ +------+ +---------+ +------------+
-         |        |        |           |
-         +--------+--------+-----------+
+       +--------+-------+-------+---------+
+       |        |       |       |         |
+  +----v---+ +--v--+ +--v---+ +v------+ +v---------+
+  | Regime | | Grid| |Delta | |Invent.| |AI Signal |
+  | Router | | Eng.| |Skew  | |Arbiter| |Engine    |
+  +--------+ +-----+ +------+ +-------+ +----------+
+       |        |       |       |         |
+       +--------+-------+-------+---------+
                         |
                +--------v---------+
                |  Order Manager   |
@@ -89,16 +93,17 @@ Runs a mean-reversion grid strategy on Kraken's WebSocket v2 API, with every buy
 
 Each strategy tick (~100ms) runs the following pipeline:
 
-1. **Market data** — Update inventory price, regime router
+1. **Market data** — Update inventory price, regime router, VWAP
 2. **Circuit breaker** — Check price velocity; freeze if >3% move in 60s
 3. **Risk update** — Compute portfolio drawdown, update pause state
 4. **Regime classification** — EWMA vol + momentum -> Regime enum
-5. **Grid computation** — N buy/sell levels with fee-aware spacing
-6. **Tax gating** — Tax Agent recommends sell-level count based on sellable ratio
-7. **Delta skew** — Skew buy/sell spacing based on allocation deviation
-8. **Order decisions** — Per-slot decide_action(): Add / Amend / Cancel / Noop
-9. **Rate limiting** — Gate add/amend commands against Kraken's rate counter
-10. **Dispatch** — Commands sent to WS2; fills update FIFO ledger
+5. **AI signal** — Query LLM for directional bias (rate-limited, async)
+6. **Grid computation** — N buy/sell levels with fee-aware spacing
+7. **Tax gating** — Tax Agent recommends sell-level count based on sellable ratio
+8. **Delta skew** — Skew buy/sell spacing based on allocation deviation + AI bias
+9. **Order decisions** — Per-slot decide_action(): Add / Amend / Cancel / Noop
+10. **Rate limiting** — Gate add/amend commands against Kraken's rate counter
+11. **Dispatch** — Commands sent to WS2; fills update FIFO ledger
 
 ### Pause State Machine
 
@@ -137,6 +142,7 @@ EMPTY ──add_order──> PENDING_NEW ──ack──> LIVE
 - **Emergency override**: Portfolio drawdown >20% overrides all tax locks
 - **ECB reference rate**: All EUR conversions use the official ECB daily rate
 - **Tax-loss harvesting**: Proactive selling of underwater lots to offset YTD gains, targeting net below Freigrenze
+- **Annual report automation**: Auto-generate Anlage SO CSV/JSON at year-end
 
 ## Project Structure
 
@@ -144,15 +150,17 @@ EMPTY ──add_order──> PENDING_NEW ──ack──> LIVE
 src/icryptotrader/
   __init__.py              # Package root, version
   types.py                 # Shared enums, dataclasses (HarvestRecommendation, FeeTier, ...)
-  config.py                # TOML config loader with typed dataclasses
+  config.py                # TOML config loader with validation and typed dataclasses
   logging_setup.py         # Structured JSON / dev logging
   lifecycle.py             # Graceful shutdown, startup reconciliation, reconnect recovery
+  metrics.py               # Prometheus-compatible metrics registry and HTTP server
 
   strategy/
     strategy_loop.py       # Main tick orchestrator with ledger auto-save
     grid_engine.py         # Grid level computation
-    regime_router.py       # EWMA vol / momentum regime classifier
+    regime_router.py       # EWMA vol / momentum regime classifier + VWAP tracking
     bollinger.py           # Bollinger Band volatility-adaptive grid spacing
+    ai_signal.py           # Multi-provider AI signal engine (Gemini, Anthropic, OpenAI)
 
   order/
     order_manager.py       # Amend-first slot state machine
@@ -166,9 +174,9 @@ src/icryptotrader/
     inventory_arbiter.py   # BTC/USD allocation enforcement per regime
 
   tax/
-    fifo_ledger.py         # FIFO lot tracking, cost basis, persistence, underwater_lots()
+    fifo_ledger.py         # FIFO lot tracking, cost basis, atomic persistence, underwater_lots()
     tax_agent.py           # Sell veto, Freigrenze, near-threshold, tax-loss harvesting
-    tax_report.py          # Anlage SO report generator (CSV, JSON, text)
+    tax_report.py          # Anlage SO report generator (CSV, JSON, text) + auto-generate
     ecb_rates.py           # ECB EUR/USD reference rate fetcher
     lot_viewer.py          # Lot age visualization (table, histogram, unlock schedule)
 
@@ -187,7 +195,7 @@ src/icryptotrader/
 config/
   default.toml             # Default configuration
 
-tests/                     # 385 tests across 24 test files
+tests/                     # 441 tests across 26 test files
 ```
 
 ## Configuration
@@ -262,6 +270,22 @@ max_spacing_bps = "200"    # Hard cap
 enabled = false
 bot_token = ""
 chat_id = ""
+
+[ai_signal]
+enabled = false
+provider = "gemini"        # "gemini", "anthropic", "openai"
+api_key = ""
+model = "gemini-2.0-flash"
+temperature = 0.2
+max_tokens = 512
+cooldown_sec = 300         # Min seconds between AI calls
+weight = 0.3               # Signal weight vs grid (0.0-1.0)
+timeout_sec = 10
+
+[metrics]
+enabled = false
+port = 9090
+prefix = "icryptotrader"
 ```
 
 ## Installation
@@ -283,6 +307,24 @@ ruff check src/ tests/
 
 **Requirements**: Python 3.11+, websockets, orjson, pyzmq, httpx
 
+## AI Signal Engine
+
+The bot includes a flexible AI signal engine that queries LLM providers for directional bias:
+
+| Provider | Model | Use Case |
+|----------|-------|----------|
+| **Google Gemini** | `gemini-2.0-flash` | Default — fast, low-cost, good for frequent signals |
+| **Anthropic Claude** | `claude-sonnet-4-6` | Higher reasoning quality for complex market analysis |
+| **OpenAI** | `gpt-4o` | Alternative provider for redundancy |
+
+The AI signal provides:
+- **Direction**: STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL
+- **Confidence**: 0.0 to 1.0 — used to weight the signal
+- **Bias (bps)**: Applied as additional grid spacing skew
+- **Regime hint**: Optional regime suggestion from the AI
+
+The engine is **fail-open** — if the AI provider is unreachable, the bot continues with grid-only trading. Calls are rate-limited by `cooldown_sec` to avoid quota exhaustion.
+
 ## Fee Model
 
 Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier:
@@ -301,7 +343,7 @@ Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier
 ## Testing
 
 ```bash
-# Full suite (385 tests)
+# Full suite (441 tests)
 pytest -v
 
 # With coverage
@@ -310,43 +352,47 @@ pytest --cov=icryptotrader --cov-report=term-missing
 # Specific module
 pytest tests/test_fifo_ledger.py -v     # FIFO ledger + underwater lots
 pytest tests/test_tax_agent.py -v       # Tax veto + harvest recommendations
+pytest tests/test_ai_signal.py -v       # AI signal engine (all providers)
 pytest tests/test_bollinger.py -v       # Bollinger Band spacing
 pytest tests/test_book_manager.py -v    # L2 book + CRC32 checksums
+pytest tests/test_config.py -v          # Config validation
+pytest tests/test_metrics.py -v         # Prometheus metrics
 pytest tests/test_order_manager.py -v
 pytest tests/test_strategy_loop.py -v
-pytest tests/test_lifecycle.py -v      # Graceful shutdown + reconciliation
-pytest tests/test_lot_viewer.py -v     # Lot age visualization
+pytest tests/test_lifecycle.py -v       # Graceful shutdown + reconciliation
+pytest tests/test_lot_viewer.py -v      # Lot age visualization
 ```
 
-Test coverage spans all critical paths: FIFO lot accounting, underwater lot identification, tax-loss harvest recommendations, order state transitions, risk pause states, circuit breaker hysteresis, regime classification, fee tier resolution, rate limiting, WS codec, grid computation, delta skew, inventory allocation, tax agent veto logic, ECB rates, tax reporting, Bollinger Band spacing, L2 book checksums, Telegram notifications, graceful shutdown/reconciliation, and lot age visualization.
+Test coverage spans all critical paths: FIFO lot accounting, underwater lot identification, tax-loss harvest recommendations, order state transitions, risk pause states, circuit breaker hysteresis, regime classification, VWAP tracking, fee tier resolution, rate limiting, WS codec, grid computation, delta skew, inventory allocation, tax agent veto logic, ECB rates, tax reporting, annual report automation, Bollinger Band spacing, L2 book checksums, Telegram notifications, graceful shutdown/reconciliation, lot age visualization, AI signal engine (Gemini/Anthropic/OpenAI), config validation, and structured metrics.
 
 ## Roadmap
 
 ### Phase 2 — Production Hardening (Implemented)
 
 - [x] **Ledger persistence on fill**: Auto-save FIFO ledger to disk after every fill
+- [x] **Atomic ledger writes**: Crash-safe persistence using temp file + atomic rename + fsync
 - [x] **httpx.AsyncClient reuse**: Shared `httpx.AsyncClient` across WS token requests
 - [x] **Balances channel subscription**: WS2 `balances` channel for real-time BTC/USD balance updates
 - [x] **Telegram notifications**: Fill alerts, risk state changes, daily P&L summaries, tax unlock countdowns
 - [x] **Graceful shutdown**: SIGTERM/SIGINT handler that cancels all orders, disarms DMS, saves ledger, and exits cleanly
 - [x] **Startup reconciliation flow**: On boot, load ledger from disk, connect WS2, reconcile via executions snapshot, cancel orphans, then begin trading
+- [x] **Config validation**: Startup validation catches invalid values (ranges, ordering, required fields)
 - [ ] **Process isolation**: Split into Feed Process (WS1 + ZMQ PUB) and Strategy Process (WS2 + strategy loop) for crash isolation
 
-### Phase 3 — Observability & Resilience (Partially Implemented)
+### Phase 3 — Observability & Resilience (Implemented)
 
 - [x] **Order book checksum validation**: L2 book manager with CRC32 checksum validation per Kraken WS v2 spec
 - [x] **Circuit breaker hysteresis**: Cooldown period with 50% recovery threshold before re-entering trading after velocity freeze
 - [x] **Reconnect state recovery**: LifecycleManager reconciles order slots against exchange snapshots after reconnect, cancels orphan orders
-- [ ] **Structured metrics export**: Prometheus/OpenTelemetry metrics for tick latency, fill rate, drawdown, rate limiter utilization, regime distribution
+- [x] **Structured metrics export**: Prometheus-compatible metrics registry (counters, gauges, histograms) with built-in HTTP server
 - [ ] **Dashboard**: Grafana or web UI showing grid state, lot ages, portfolio allocation, tax countdown timers
-- [ ] **Async callbacks in WS dispatch**: Move execution/ack callbacks to an asyncio queue to avoid blocking the WS receive loop
 
-### Phase 4 — Strategy Enhancements (Partially Implemented)
+### Phase 4 — Strategy Enhancements (Implemented)
 
 - [x] **Bollinger Band volatility spacing**: Automatic `spacing_bps` adjustment based on rolling Bollinger Band width with configurable scale, floor, and cap
 - [x] **Dynamic grid sizing**: Per-regime `order_size_scale` adjusts order notional (1.0x range-bound, 0.75x trending, 0.5x chaos), wired through RegimeRouter → StrategyLoop → GridEngine
-- [ ] **Signal Engine**: Second alpha source alongside the grid (e.g., momentum, mean-reversion signals on longer timeframes)
-- [ ] **Volume-weighted mid-price**: Use VWAP from recent trades instead of simple mid for grid centering
+- [x] **AI Signal Engine**: Multi-provider LLM signals (Gemini, Anthropic, OpenAI) for directional bias, confidence scoring, and regime hints
+- [x] **Volume-weighted mid-price**: VWAP from recent trades for stable grid centering, integrated into RegimeRouter
 - [ ] **Adaptive regime thresholds**: Self-tuning EWMA/momentum thresholds based on rolling realized vol distributions
 - [ ] **Multi-pair support**: Extend `Pair`, `FeeModel`, and slot allocation to trade multiple BTC pairs (e.g., XBT/EUR)
 
@@ -354,7 +400,7 @@ Test coverage spans all critical paths: FIFO lot accounting, underwater lot iden
 
 - [x] **Tax-loss harvesting**: `underwater_lots()` + `recommend_loss_harvest()` with Freigrenze targeting, near-threshold protection, and configurable rate limits
 - [x] **Lot age visualization**: CLI view with per-lot table, ASCII age histogram, projected tax-free unlock schedule, and portfolio summary
-- [ ] **Annual report automation**: Auto-generate Anlage SO at year-end, email to configured address or push to tax advisor portal
+- [x] **Annual report automation**: Auto-generate Anlage SO CSV/JSON via `auto_generate_annual_report()` method
 - [ ] **Multi-year carry-forward**: Track loss carry-forward across tax years for accurate Freigrenze calculations
 
 ### Backlog (Low Priority)
@@ -364,6 +410,7 @@ Test coverage spans all critical paths: FIFO lot accounting, underwater lot iden
 - [ ] REST fallback for order placement when WS2 is temporarily disconnected
 - [ ] FIX API support as alternative to WebSocket for lower-latency execution
 - [ ] Backtesting harness with historical tick data replay through the strategy loop
+- [ ] Dashboard (Grafana or web UI)
 
 ## License
 

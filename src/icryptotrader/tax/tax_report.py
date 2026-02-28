@@ -180,6 +180,31 @@ class TaxReportGenerator:
 
         logger.info("Tax report JSON exported to %s", path)
 
+    def auto_generate_annual_report(self, year: int, data_dir: Path) -> tuple[Path, Path] | None:
+        """Auto-generate CSV and JSON reports for a given tax year.
+
+        Called automatically on January 1 for the previous year, or on demand.
+        Returns (csv_path, json_path) or None if no disposals.
+        """
+        summary = self.annual_summary(year)
+        if summary.total_disposals == 0:
+            logger.info("No disposals for %d, skipping annual report", year)
+            return None
+
+        reports_dir = data_dir / "tax_reports"
+        csv_path = reports_dir / f"anlage_so_{year}.csv"
+        json_path = reports_dir / f"anlage_so_{year}.json"
+
+        self.export_csv(year, csv_path)
+        self.export_json(year, json_path)
+
+        logger.info(
+            "Annual tax report for %d: %d disposals, net EUR %.2f (Freigrenze: %s)",
+            year, summary.total_disposals, summary.net_taxable_eur,
+            "within" if summary.within_freigrenze else "EXCEEDED",
+        )
+        return csv_path, json_path
+
     def format_summary_text(self, year: int) -> str:
         """Human-readable summary for Telegram / logging."""
         s = self.annual_summary(year)
