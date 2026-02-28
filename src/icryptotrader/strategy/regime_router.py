@@ -293,14 +293,29 @@ class RegimeRouter:
             logger.warning("Regime override: %s → %s (%s)", old.value, regime.value, reason)
 
     def _compute_momentum(self) -> float:
-        """Compute price momentum from recent price history."""
+        """Compute price momentum over a fixed time window.
+
+        Uses the ``momentum_window`` (seconds) to find the oldest price
+        within that horizon, ensuring a consistent time base regardless
+        of tick rate.  Previously used a fixed tick count, which made
+        the horizon expand/contract with market activity.
+        """
         if len(self._price_history) < 2:
             return 0.0
-        oldest = self._price_history[0][1]
-        newest = self._price_history[-1][1]
-        if oldest <= 0:
+
+        newest_t, newest_price = self._price_history[-1]
+        cutoff = newest_t - self._momentum_window
+
+        # Find the oldest entry within the momentum window
+        ref_price: Decimal | None = None
+        for t, p in self._price_history:
+            if t >= cutoff:
+                ref_price = p
+                break
+
+        if ref_price is None or ref_price <= 0:
             return 0.0
-        return float((newest - oldest) / oldest)
+        return float((newest_price - ref_price) / ref_price)
 
     def _set_regime(
         self,

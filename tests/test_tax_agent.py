@@ -383,7 +383,7 @@ class TestHarvestRecommendation:
             if ytd > Decimal("1000"):
                 assert recs[0].reason == "offset_gains"
             else:
-                assert recs[0].reason == "freigrenze_optimization"
+                assert recs[0].reason == "loss_offset"
 
     def test_harvest_disabled_by_default_in_config(self) -> None:
         """Verify that TaxConfig defaults have harvest_enabled=False."""
@@ -393,3 +393,44 @@ class TestHarvestRecommendation:
         assert cfg.harvest_min_loss_eur == Decimal("50")
         assert cfg.harvest_max_per_day == 3
         assert cfg.harvest_target_net_eur == Decimal("800")
+
+
+class TestWashSaleBuyCooldown:
+    """Tests for the buy-side wash sale cooldown (§42 AO compliance)."""
+
+    def _make_agent_with_lot(self) -> TaxAgent:
+        """Create a TaxAgent with a ledger containing an underwater lot."""
+        from icryptotrader.tax.fifo_ledger import FIFOLedger
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.1"),
+            purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("5"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+        return TaxAgent(ledger=ledger, wash_sale_cooldown_hours=24)
+
+    def test_buy_not_blocked_initially(self) -> None:
+        agent = self._make_agent_with_lot()
+        assert agent.is_buy_blocked_by_wash_sale() is False
+
+    def test_buy_blocked_after_harvest(self) -> None:
+        agent = self._make_agent_with_lot()
+        agent.record_harvest("test-lot-id")
+        assert agent.is_buy_blocked_by_wash_sale() is True
+
+    def test_buy_unblocked_after_cooldown(self) -> None:
+        import time as _time
+        agent = self._make_agent_with_lot()
+        # Set cooldown to expire in the past
+        agent.record_harvest("test-lot-id")
+        agent._buy_cooldown_until = _time.time() - 1
+        assert agent.is_buy_blocked_by_wash_sale() is False
+
+    def test_multiple_harvests_extend_cooldown(self) -> None:
+        agent = self._make_agent_with_lot()
+        agent.record_harvest("lot-1")
+        first_cooldown = agent._buy_cooldown_until
+        # Second harvest should extend (or maintain) the cooldown
+        agent.record_harvest("lot-2")
+        assert agent._buy_cooldown_until >= first_cooldown

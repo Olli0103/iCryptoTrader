@@ -201,10 +201,10 @@ class TestConvexDeltaSkew:
         assert abs(result.raw_skew_bps) < Decimal("5")
 
     def test_large_deviation_capped(self) -> None:
-        """20% deviation should hit the 30bps cap."""
+        """20% deviation should hit the 50bps cap (new default)."""
         skew = DeltaSkew(sensitivity=Decimal("1.0"))
         result = skew.compute(btc_alloc_pct=0.70, target_pct=0.50)
-        assert result.buy_offset_bps == Decimal("30")
+        assert result.buy_offset_bps == Decimal("50")
 
     def test_quadratic_not_linear(self) -> None:
         """Doubling deviation should more-than-double the raw skew."""

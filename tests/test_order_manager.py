@@ -453,3 +453,48 @@ class TestQueryMethods:
         om.slots[2].side = Side.BUY
         assert len(om.buy_slots()) == 2
         assert len(om.sell_slots()) == 1
+
+
+class TestPriceEpsilon:
+    def test_default_epsilon_for_btc(self) -> None:
+        """Default price_epsilon = 0.1 works for BTC/USD."""
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        slot.state = SlotState.LIVE
+        slot.order_id = "O1"
+        slot.price = Decimal("85000")
+        slot.qty = Decimal("0.01")
+        slot.side = Side.BUY
+        # $0.05 change < default epsilon $0.1 → noop
+        action = om.decide_action(slot, _desired("85000.05", "0.01"))
+        assert isinstance(action, Action.Noop)
+
+    def test_custom_epsilon_for_xrp(self) -> None:
+        """XRP-like pair with price_epsilon=0.0001."""
+        om = OrderManager(num_slots=1, price_epsilon=Decimal("0.0001"))
+        slot = om.slots[0]
+        slot.state = SlotState.LIVE
+        slot.order_id = "O1"
+        slot.price = Decimal("0.5000")
+        slot.qty = Decimal("1000")
+        slot.side = Side.BUY
+        # $0.01 change on XRP = 200 bps — should trigger amend
+        action = om.decide_action(slot, _desired("0.4900", "1000"))
+        assert isinstance(action, Action.AmendOrder)
+
+    def test_small_move_below_bps_threshold_ignored(self) -> None:
+        """Even with tight epsilon, sub-threshold BPS moves are ignored."""
+        om = OrderManager(
+            num_slots=1,
+            price_epsilon=Decimal("0.0001"),
+            amend_threshold_bps=Decimal("10"),
+        )
+        slot = om.slots[0]
+        slot.state = SlotState.LIVE
+        slot.order_id = "O1"
+        slot.price = Decimal("85000")
+        slot.qty = Decimal("0.01")
+        slot.side = Side.BUY
+        # $1 change on BTC = ~1.2 bps < 10 bps threshold → noop
+        action = om.decide_action(slot, _desired("85001", "0.01"))
+        assert isinstance(action, Action.Noop)

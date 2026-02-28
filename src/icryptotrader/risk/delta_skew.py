@@ -20,8 +20,11 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
-# Maximum skew in basis points (prevent runaway asymmetry)
-MAX_SKEW_BPS = Decimal("30")
+# Maximum skew in basis points (prevent runaway asymmetry).
+# 50 bps gives the quadratic curve room to breathe across the 0-10%
+# deviation range before saturating (with sensitivity=1.0, saturation
+# occurs at ~10% deviation instead of ~5.5% with the old 30 bps cap).
+MAX_SKEW_BPS = Decimal("50")
 # Default OBI sensitivity: OBI of 1.0 → 15 bps adjustment
 DEFAULT_OBI_SENSITIVITY_BPS = Decimal("15")
 
@@ -53,7 +56,7 @@ class DeltaSkew:
 
     def __init__(
         self,
-        sensitivity: Decimal = Decimal("2.0"),
+        sensitivity: Decimal = Decimal("1.0"),
         max_skew_bps: Decimal = MAX_SKEW_BPS,
         obi_sensitivity_bps: Decimal = DEFAULT_OBI_SENSITIVITY_BPS,
     ) -> None:
@@ -99,9 +102,10 @@ class DeltaSkew:
         deviation = btc_alloc_pct - target_pct
 
         # Convex quadratic scaling: gradual for small deviations, aggressive for large
-        # E.g., 5% deviation → sign(0.05) * (5)^2 * 0.5 = 12.5 bps
-        #        10% deviation → sign(0.10) * (10)^2 * 0.5 = 50 bps (clamped to 30)
-        #        2% deviation → sign(0.02) * (2)^2 * 0.5 = 2 bps
+        # With sensitivity=1.0:
+        #   2% deviation → sign(0.02) * (2)^2 * 0.5 * 1.0 = 2 bps
+        #   5% deviation → sign(0.05) * (5)^2 * 0.5 * 1.0 = 12.5 bps
+        #   10% deviation → sign(0.10) * (10)^2 * 0.5 * 1.0 = 50 bps (clamped to 50)
         dev_bps = deviation * 100  # Convert to percentage points
         sign = Decimal("1") if deviation >= 0 else Decimal("-1")
         raw_skew_bps = sign * Decimal(str(dev_bps * dev_bps)) * Decimal("0.5") * self._sensitivity

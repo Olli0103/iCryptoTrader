@@ -36,12 +36,15 @@ from icryptotrader.types import Side, SlotState
 
 logger = logging.getLogger(__name__)
 
-# Price/qty comparison epsilon (avoid floating point noise)
-PRICE_EPSILON = Decimal("0.01")  # $0.01 for BTC/USD
-QTY_EPSILON = Decimal("0.00000001")  # 1 satoshi
+# Quantity comparison epsilon (1 satoshi)
+QTY_EPSILON = Decimal("0.00000001")
+# Default price epsilon: filters sub-tick noise. Should match the pair's tick size.
+# BTC/USD = 0.1, ETH/USD = 0.01, XRP/USD = 0.0001.
+DEFAULT_PRICE_EPSILON = Decimal("0.1")
 # Default amend threshold: only amend if price moved by this many bps.
 # On Kraken, amending price resets queue priority. Micro-amends destroy fill rates.
-DEFAULT_AMEND_THRESHOLD_BPS = Decimal("3")
+# 10 bps is wide enough to preserve queue position while still tracking the market.
+DEFAULT_AMEND_THRESHOLD_BPS = Decimal("10")
 
 
 @dataclass
@@ -125,12 +128,14 @@ class OrderManager:
         pair: str = "XBT/USD",
         amend_threshold_bps: Decimal = DEFAULT_AMEND_THRESHOLD_BPS,
         post_only: bool = True,
+        price_epsilon: Decimal = DEFAULT_PRICE_EPSILON,
     ) -> None:
         self._pair = pair
         self._post_only = post_only
         self._rate_limiter = rate_limiter or RateLimiter()
         self._pending_timeout_sec = pending_timeout_ms / 1000.0
         self._amend_threshold_bps = amend_threshold_bps
+        self._price_epsilon = price_epsilon
 
         # Order slots: indices 0..num_slots-1
         self._slots = [OrderSlot(slot_id=i) for i in range(num_slots)]
@@ -211,7 +216,7 @@ class OrderManager:
             # priority. Only amend if the price moved significantly (>N bps).
             # This prevents micro-amends that destroy fill rates.
             price_diff = abs(slot.price - desired.price)
-            price_changed = price_diff > PRICE_EPSILON
+            price_changed = price_diff > self._price_epsilon
             if price_changed and slot.price > 0:
                 move_bps = (price_diff / slot.price) * Decimal("10000")
                 if move_bps < self._amend_threshold_bps:
@@ -333,7 +338,7 @@ class OrderManager:
             slot.state = SlotState.LIVE
             # Update price/qty from the desired level (confirmed by exchange)
             if slot.desired:
-                if abs(slot.price - slot.desired.price) > PRICE_EPSILON:
+                if abs(slot.price - slot.desired.price) > self._price_epsilon:
                     slot.price = slot.desired.price
                 if abs(slot.remaining_qty() - slot.desired.qty) > QTY_EPSILON:
                     slot.qty = slot.desired.qty + slot.filled_qty

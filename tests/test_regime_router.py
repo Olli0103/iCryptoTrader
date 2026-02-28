@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import patch
 
 from icryptotrader.strategy.regime_router import RegimeRouter
 from icryptotrader.types import Regime
@@ -195,3 +196,37 @@ class TestGridLevelRecommendations:
         if decision.regime == Regime.CHAOS:
             assert decision.grid_levels_buy == 0
             assert decision.grid_levels_sell == 0
+
+
+class TestTimeBasedMomentum:
+    """Momentum uses fixed time window, not fixed tick count."""
+
+    def test_momentum_uses_time_window(self) -> None:
+        """Prices outside the time window should NOT affect momentum."""
+        t = 0.0
+        with patch("icryptotrader.strategy.regime_router.time.monotonic", side_effect=lambda: t):
+            router = RegimeRouter(momentum_window=60)  # 60 second window
+
+            # t=0: first price
+            t = 0.0
+            router.update_price(Decimal("85000"))
+
+            # t=30: second price (within window)
+            t = 30.0
+            router.update_price(Decimal("86000"))
+
+            # Momentum should use t=0 entry (within 60s window)
+            decision = router.classify()
+            mom_within = decision.signals.price_momentum
+            assert mom_within > 0  # Positive momentum
+
+            # t=70: old entry is now outside the 60s window
+            t = 70.0
+            router.update_price(Decimal("86100"))
+
+            # Momentum should use t=30 entry (oldest within window)
+            # not t=0 (outside window)
+            decision = router.classify()
+            mom_after = decision.signals.price_momentum
+            # mom should be based on 86000→86100, not 85000→86100
+            assert mom_after < mom_within  # Smaller momentum since reference is closer
