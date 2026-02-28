@@ -80,9 +80,12 @@ Once you're comfortable, increase `order_size_usd` and `grid.levels` in the conf
 ### Trading
 - **Grid Trading Engine** — Automatically places buy and sell orders in a symmetric grid around the current price
 - **Bollinger Band Spacing** — Grid spacing automatically widens when the market is volatile and tightens when it's calm (so you don't get caught in big swings)
+- **Avellaneda-Stoikov Model** — Optional optimal market-making model where spread and inventory skew both scale with volatility (the key A-S insight: when vol is high AND you hold inventory, the skew is much larger)
+- **Order Book Imbalance (OBI)** — Microstructure signal from L2 book depth drives spacing asymmetry (bullish book = tighter buys, wider sells)
 - **AI Signal Engine** — Optionally asks an AI (Gemini, Claude, or GPT) for market direction and adjusts the grid accordingly
 - **Dynamic Grid Sizing** — Order sizes automatically scale down during scary markets and scale up during calm ones
 - **Multi-Pair Support** — Trade multiple pairs (e.g., BTC/USD + BTC/EUR) with weighted capital allocation
+- **Event-Driven Architecture** — WS callbacks (book updates, trades, fills) wake the tick loop instantly instead of fixed polling
 
 ### Risk Protection
 - **Circuit Breaker** — If the price moves more than 3% in 60 seconds, the bot freezes to avoid trading in a crash
@@ -167,6 +170,13 @@ multiplier = 2.0                   # Standard Bollinger multiplier
 spacing_scale = 0.5                # How much Bollinger affects spacing
 min_spacing_bps = "15"             # Never go below 15 bps (0.15%)
 max_spacing_bps = "200"            # Never go above 200 bps (2.0%)
+
+[avellaneda_stoikov]
+enabled = false                    # When true, replaces Bollinger + DeltaSkew with A-S model
+gamma = 0.3                        # Risk aversion [0.01, 2.0]. Higher = wider spread
+max_spread_bps = "500"             # Hard cap on half-spread per side
+max_skew_bps = "50"                # Hard cap on inventory + OBI skew combined
+obi_sensitivity_bps = "10"         # OBI of +/-1.0 maps to this many bps adjustment
 
 [telegram]
 enabled = false                    # Set to true to enable Telegram alerts
@@ -308,7 +318,7 @@ If you're a developer looking to understand or modify the code, this section is 
 
 ### Tick Cycle
 
-Each strategy tick (~100ms) runs the following pipeline:
+Each strategy tick (event-driven, wakes on WS book/trade/fill events with 1s max fallback) runs the following pipeline:
 
 1. **Market data** — Update inventory price, regime router, VWAP
 2. **Circuit breaker** — Check price velocity; freeze if >3% move in 60s
@@ -317,10 +327,11 @@ Each strategy tick (~100ms) runs the following pipeline:
 5. **AI signal** — Query LLM for directional bias (rate-limited, async)
 6. **Grid computation** — N buy/sell levels with fee-aware spacing
 7. **Tax gating** — Tax Agent recommends sell-level count based on sellable ratio
-8. **Delta skew** — Skew buy/sell spacing based on allocation deviation + AI bias
-9. **Order decisions** — Per-slot decide_action(): Add / Amend / Cancel / Noop
-10. **Rate limiting** — Gate add/amend commands against Kraken's rate counter
-11. **Dispatch** — Commands sent to WS2; fills update FIFO ledger
+8. **Hedge evaluation** — HedgeManager caps buy levels and boosts sell levels during drawdowns
+9. **Delta skew / A-S** — Skew buy/sell spacing based on allocation deviation + OBI + AI bias (or A-S model if enabled)
+10. **Order decisions** — Per-slot decide_action(): Add / Amend / Cancel / Noop
+11. **Rate limiting** — Gate add/amend commands against Kraken's rate counter
+12. **Dispatch** — Commands sent to WS2; fills update FIFO ledger
 
 ### Pause State Machine
 
@@ -377,10 +388,11 @@ src/icryptotrader/
   setup_wizard.py          # Interactive first-run configuration wizard
 
   strategy/
-    strategy_loop.py       # Main tick orchestrator with ledger auto-save
+    strategy_loop.py       # Main tick orchestrator with ledger auto-save, event-driven
     grid_engine.py         # Grid level computation
     regime_router.py       # EWMA vol / momentum regime classifier + VWAP tracking
     bollinger.py           # Bollinger Band + ATR volatility-adaptive grid spacing
+    avellaneda_stoikov.py  # Avellaneda-Stoikov optimal market making model
     ai_signal.py           # Multi-provider AI signal engine (Gemini, Anthropic, OpenAI)
 
   order/
@@ -423,7 +435,7 @@ src/icryptotrader/
 config/
   default.toml             # Default configuration
 
-tests/                     # 645 tests across 33 test files
+tests/                     # 759 tests across 35 test files
 ```
 
 ---
@@ -466,7 +478,7 @@ Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier
 ## Testing
 
 ```bash
-# Full suite (645 tests)
+# Full suite (759 tests)
 pytest -v
 
 # With coverage report
@@ -504,11 +516,13 @@ pytest tests/test_metrics.py -v        # Prometheus metrics (12 tests)
 pytest tests/test_backtest_engine.py -v # Backtest engine (11 tests)
 pytest tests/test_hedge_manager.py -v  # Hedge manager (10 tests)
 pytest tests/test_strategy_loop_wiring.py -v  # Bollinger, AI, SQLite wiring (16 tests)
-pytest tests/test_watchdog.py -v       # Process watchdog (5 tests)
+pytest tests/test_delta_skew.py -v     # Delta skew + OBI integration (14 tests)
+pytest tests/test_avellaneda_stoikov.py -v  # A-S optimal market making (19 tests)
+pytest tests/test_watchdog.py -v       # Process watchdog (6 tests)
 pytest tests/test_web_dashboard.py -v  # Web dashboard (7 tests)
 ```
 
-**Line coverage: 80%** (4,226 statements, 3,380 covered). Uncovered lines are primarily async WebSocket connection code and the interactive setup wizard — all business logic paths are thoroughly tested, including 13 end-to-end integration tests exercising the full tick cycle with real components (no mocks).
+**759 tests**, all business logic paths thoroughly tested, including 13 end-to-end integration tests exercising the full tick cycle with real components (no mocks). Uncovered lines are primarily async WebSocket connection code and the interactive setup wizard.
 
 ---
 
@@ -516,14 +530,19 @@ pytest tests/test_web_dashboard.py -v  # Web dashboard (7 tests)
 
 ### Phase 2 — Production Hardening (Done)
 
-- [x] Ledger persistence on fill
+- [x] Ledger persistence on fill (async executor save)
 - [x] Atomic ledger writes (crash-safe)
 - [x] httpx.AsyncClient reuse
 - [x] Balances channel subscription
-- [x] Telegram notifications
-- [x] Graceful shutdown (SIGTERM/SIGINT)
+- [x] Telegram notifications + interactive BotActionProvider
+- [x] Graceful shutdown (SIGTERM/SIGINT + watchdog)
 - [x] Startup reconciliation flow
 - [x] Config validation
+- [x] OrderManager fill/execution/ack callback wiring
+- [x] ECB rate service (background task, 4h refresh)
+- [x] WebDashboard wired with risk_manager + metrics
+- [x] Hedge manager properly wired (buy_level_cap, sell_level_boost, sell_spacing_tighten)
+- [x] FIFO ledger aggregate caching (total_btc, tax_free_btc)
 - [ ] Process isolation (Feed + Strategy split)
 
 ### Phase 3 — Observability & Resilience (Done)
@@ -541,6 +560,9 @@ pytest tests/test_web_dashboard.py -v  # Web dashboard (7 tests)
 - [x] AI Signal Engine (Gemini, Claude, GPT)
 - [x] Volume-weighted mid-price (VWAP)
 - [x] Multi-pair support (PairManager)
+- [x] Order Book Imbalance (OBI) → grid spacing asymmetry
+- [x] Avellaneda-Stoikov optimal market making model
+- [x] Event-driven tick loop (WS callbacks instead of polling)
 - [ ] Adaptive regime thresholds
 
 ### Phase 5 — Tax Optimization (Done)
