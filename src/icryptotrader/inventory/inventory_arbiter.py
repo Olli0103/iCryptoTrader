@@ -11,6 +11,7 @@ The Inventory Arbiter:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -69,9 +70,15 @@ class InventoryArbiter:
         self,
         limits: dict[Regime, AllocationLimits] | None = None,
         max_single_rebalance_pct: float = 0.10,
+        max_rebalance_pct_per_min: float = 0.01,
     ) -> None:
         self._limits = limits or dict(DEFAULT_LIMITS)
         self._max_rebalance_pct = max_single_rebalance_pct
+
+        # TWAP rate-limiting: track USD rebalanced per minute window
+        self._max_rebalance_pct_per_min = max_rebalance_pct_per_min
+        self._rebalance_window_sec = 60.0
+        self._rebalance_history: list[tuple[float, Decimal]] = []
 
         self._btc_balance = Decimal("0")
         self._usd_balance = Decimal("0")
@@ -184,6 +191,25 @@ class InventoryArbiter:
         max_allowed = self._max_sell_btc(alloc, limits, self.portfolio_value_usd)
         return min(qty_btc, max_allowed, self._btc_balance)
 
+    def _twap_remaining_usd(self, total_usd: Decimal) -> Decimal:
+        """USD budget remaining in the current TWAP window (1 minute).
+
+        Prevents sweeping the book: max rebalance_pct_per_min of portfolio
+        can be rebalanced in any rolling 60-second window.
+        """
+        now = time.monotonic()
+        cutoff = now - self._rebalance_window_sec
+        self._rebalance_history = [
+            (t, amt) for t, amt in self._rebalance_history if t >= cutoff
+        ]
+        used = sum((amt for _, amt in self._rebalance_history), Decimal("0"))
+        budget = total_usd * Decimal(str(self._max_rebalance_pct_per_min))
+        return max(Decimal("0"), budget - used)
+
+    def record_rebalance(self, usd_amount: Decimal) -> None:
+        """Record a rebalance for TWAP tracking. Call after order placement."""
+        self._rebalance_history.append((time.monotonic(), abs(usd_amount)))
+
     def _max_buy_btc(
         self, alloc: float, limits: AllocationLimits, total_usd: Decimal,
     ) -> Decimal:
@@ -198,6 +224,10 @@ class InventoryArbiter:
         # Cap to single-tick rebalance limit
         effective_pct = Decimal(str(min(headroom_pct, self._max_rebalance_pct)))
         max_usd = total_usd * effective_pct
+
+        # TWAP rate-limit: cap to remaining budget in rolling window
+        twap_budget = self._twap_remaining_usd(total_usd)
+        max_usd = min(max_usd, twap_budget)
 
         # Also cap to available USD
         max_usd = min(max_usd, self._usd_balance)
@@ -217,5 +247,9 @@ class InventoryArbiter:
 
         effective_pct = Decimal(str(min(excess_pct, self._max_rebalance_pct)))
         max_usd = total_usd * effective_pct
+
+        # TWAP rate-limit
+        twap_budget = self._twap_remaining_usd(total_usd)
+        max_usd = min(max_usd, twap_budget)
 
         return min(max_usd / self._btc_price, self._btc_balance)

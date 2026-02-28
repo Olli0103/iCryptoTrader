@@ -30,6 +30,8 @@ class GridConfig:
     post_only: bool = True
     auto_compound: bool = False  # Reinvest profits into order size
     compound_base_usd: Decimal = Decimal("5000")  # Starting portfolio for scaling
+    geometric_spacing: bool = True  # Geometric (safe) vs linear (can go negative)
+    amend_threshold_bps: Decimal = Decimal("3")  # Min price move before amending
 
 
 @dataclass
@@ -41,6 +43,7 @@ class RiskConfig:
     price_velocity_cooldown_sec: int = 30
     trailing_stop_enabled: bool = True  # Dynamic trailing stop
     trailing_stop_tighten_pct: float = 0.02  # Tighten 2% per new HWM
+    max_rebalance_pct_per_min: float = 0.01  # TWAP: max 1% portfolio per minute
 
 
 @dataclass
@@ -53,6 +56,9 @@ class TaxConfig:
     harvest_min_loss_eur: Decimal = Decimal("50")
     harvest_max_per_day: int = 3
     harvest_target_net_eur: Decimal = Decimal("800")
+    blow_through_mode: bool = False  # Skip Freigrenze gating, maximize gross
+    harvest_wash_sale_cooldown_hours: int = 24  # §42 AO safe harbor
+    vault_lock_priority: bool = True  # Prioritize selling >365-day lots
 
 
 @dataclass
@@ -119,6 +125,17 @@ class BollingerConfig:
     atr_enabled: bool = True  # Combine ATR with Bollinger for spacing
     atr_window: int = 14  # ATR lookback period
     atr_weight: float = 0.3  # Weight of ATR vs Bollinger (0=BB only, 1=ATR only)
+
+
+@dataclass
+class AvellanedaStoikovConfig:
+    """Configuration for the Avellaneda-Stoikov optimal market making model."""
+
+    enabled: bool = False  # Opt-in; when enabled replaces Bollinger + DeltaSkew
+    gamma: float = 0.3  # Risk aversion [0.01, 2.0]. Higher = wider spread
+    max_spread_bps: Decimal = Decimal("500")
+    max_skew_bps: Decimal = Decimal("50")
+    obi_sensitivity_bps: Decimal = Decimal("10")
 
 
 @dataclass
@@ -196,6 +213,7 @@ class Config:
     ws: WSConfig = field(default_factory=WSConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     bollinger: BollingerConfig = field(default_factory=BollingerConfig)
+    avellaneda_stoikov: AvellanedaStoikovConfig = field(default_factory=AvellanedaStoikovConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     ai_signal: AISignalConfig = field(default_factory=AISignalConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
@@ -272,6 +290,10 @@ def validate_config(cfg: Config) -> list[str]:
             errors.append(f"regime.{name}: btc_target_pct must be <= btc_max_pct")
         if not (0 < alloc.order_size_scale <= 5.0):
             errors.append(f"regime.{name}: order_size_scale must be in (0, 5.0]")
+
+    # Avellaneda-Stoikov
+    if cfg.avellaneda_stoikov.enabled and cfg.avellaneda_stoikov.gamma <= 0:
+        errors.append("avellaneda_stoikov.gamma must be > 0")
 
     # Bollinger
     if cfg.bollinger.window < 2:

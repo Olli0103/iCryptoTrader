@@ -104,6 +104,29 @@ class FeeModel:
         rate = self._current_tier.maker_bps if is_maker else self._current_tier.taker_bps
         return notional_usd * rate / Decimal("10000")
 
+    def would_cross_spread(
+        self,
+        order_price: Decimal,
+        side: str,
+        best_bid: Decimal,
+        best_ask: Decimal,
+    ) -> bool:
+        """Check if a limit order would cross the spread (become a taker).
+
+        If post_only is set and this returns True, the order will be rejected.
+        The caller should widen the price or skip the order.
+        """
+        if side == "buy":
+            return order_price >= best_ask
+        return order_price <= best_bid
+
+    def taker_penalty_bps(self) -> Decimal:
+        """Extra cost in bps if an order accidentally becomes a taker.
+
+        maker_fee + taker_fee swing = the full round-trip cost difference.
+        """
+        return self._current_tier.taker_bps - self._current_tier.maker_bps
+
     def volume_to_next_tier(self) -> int | None:
         """USD volume needed to reach the next fee tier, or None if at max."""
         for tier in self._tiers:

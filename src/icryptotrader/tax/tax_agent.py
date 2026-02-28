@@ -57,11 +57,19 @@ class TaxAgent:
         annual_exemption_eur: Decimal = Decimal("1000"),
         near_threshold_days: int = 330,
         emergency_dd_pct: float = 0.20,
+        blow_through_mode: bool = False,
+        vault_lock_priority: bool = True,
+        wash_sale_cooldown_hours: int = 24,
     ) -> None:
         self._ledger = ledger
         self._annual_exemption_eur = annual_exemption_eur
         self._near_threshold_days = near_threshold_days
         self._emergency_dd_pct = emergency_dd_pct
+        self._blow_through_mode = blow_through_mode
+        self._vault_lock_priority = vault_lock_priority
+        self._wash_sale_cooldown_hours = wash_sale_cooldown_hours
+        # Track last harvest timestamps per lot for wash sale compliance
+        self._harvest_timestamps: dict[str, float] = {}
 
     def evaluate_sell(
         self,
@@ -132,8 +140,23 @@ class TaxAgent:
             )
 
         # 4. Check Freigrenze (€1,000 annual exemption)
+        #    In blow-through mode: skip this gate entirely, allow all trades
         ytd_gain = self._ledger.taxable_gain_ytd()
         estimated_gain = self._estimate_gain(qty_btc, current_price_usd, eur_usd_rate)
+
+        if self._blow_through_mode:
+            logger.info(
+                "Tax ALLOW (blow-through): YTD EUR %.2f + est EUR %.2f "
+                "(Freigrenze gating disabled)",
+                ytd_gain, estimated_gain,
+            )
+            return SellEvaluation(
+                decision=TaxVetoDecision.ALLOW,
+                allowed_qty_btc=qty_btc,
+                reason="Blow-through mode: Freigrenze gating disabled",
+                taxable_gain_if_sold_eur=estimated_gain,
+                days_until_next_free=days_until,
+            )
 
         if ytd_gain + estimated_gain < self._annual_exemption_eur:
             logger.info(
@@ -176,11 +199,16 @@ class TaxAgent:
     def recommended_sell_levels(self) -> int:
         """How many sell levels the grid should run based on sellable ratio.
 
+        In blow-through mode: always return -1 (all levels active).
+
         Ratio >= 0.8: full sell-side (return -1 for "all")
         Ratio 0.5-0.8: 60% of levels
         Ratio 0.2-0.5: 1 level
         Ratio < 0.2: 0 levels (buy-only)
         """
+        if self._blow_through_mode:
+            return -1  # All levels active in blow-through mode
+
         ratio = self.sellable_ratio()
         if ratio >= 0.8:
             return -1  # All levels
@@ -191,15 +219,52 @@ class TaxAgent:
         return 0  # Buy-only
 
     def is_tax_locked(self) -> bool:
-        """True if no BTC can be sold tax-free and we're not in Freigrenze."""
+        """True if no BTC can be sold tax-free and we're not in Freigrenze.
+
+        In blow-through mode: never locked (always allow trading).
+        """
+        if self._blow_through_mode:
+            return False
         return (
             self._ledger.tax_free_btc() == 0
             and self._ledger.total_btc() > 0
         )
 
+    def vault_lot_btc(self) -> Decimal:
+        """BTC held >365 days — tax-free 'vault' lots."""
+        return self._ledger.tax_free_btc()
+
+    def should_prioritize_vault_sell(self) -> bool:
+        """True if we have vault lots and vault_lock_priority is enabled.
+
+        The strategy should prioritize selling these lots on rallies
+        because their profits are 100% tax-free.
+        """
+        return self._vault_lock_priority and self._ledger.tax_free_btc() > 0
+
     def days_until_unlock(self) -> int | None:
         """Days until the next lot becomes tax-free."""
         return self._ledger.days_until_next_free()
+
+    def record_harvest(self, lot_id: str) -> None:
+        """Record that a lot was harvested. Starts the wash sale cooldown."""
+        import time as _time
+        self._harvest_timestamps[lot_id] = _time.time()
+
+    def is_wash_sale_safe(self, lot_id: str) -> bool:
+        """Check if enough time has passed since last harvest for this lot.
+
+        §42 AO (Gestaltungsmissbrauch): selling and immediately rebuying
+        the same asset to realize a loss is nullifiable. We enforce a
+        configurable cooldown (default 24h) before the same lot's BTC
+        can be repurchased.
+        """
+        import time as _time
+        last_harvest = self._harvest_timestamps.get(lot_id)
+        if last_harvest is None:
+            return True
+        elapsed_hours = (_time.time() - last_harvest) / 3600.0
+        return elapsed_hours >= self._wash_sale_cooldown_hours
 
     def recommend_loss_harvest(
         self,
@@ -221,6 +286,7 @@ class TaxAgent:
         3. Skip lots with losses below min_loss_eur (avoid dust)
         4. Cap at max_harvests per call
         5. Stop once enough losses are harvested to reach target_net_eur
+        6. Skip lots still in wash sale cooldown (§42 AO compliance)
         """
         ytd_gain = self._ledger.taxable_gain_ytd()
         if ytd_gain <= 0:
@@ -243,6 +309,13 @@ class TaxAgent:
 
             # Skip trivial losses
             if abs(estimated_loss) < min_loss_eur:
+                continue
+
+            # Skip lots still in wash sale cooldown
+            if not self.is_wash_sale_safe(lot.lot_id):
+                logger.debug(
+                    "Skipping lot %s: wash sale cooldown active", lot.lot_id[:8],
+                )
                 continue
 
             # Check if we still need to harvest more

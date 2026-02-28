@@ -73,12 +73,14 @@ class GridEngine:
         min_spacing_bps: Decimal = Decimal("20"),
         adverse_selection_bps: Decimal = Decimal("10"),
         min_edge_bps: Decimal = Decimal("5"),
+        geometric: bool = True,
     ) -> None:
         self._fee_model = fee_model
         self._order_size_usd = order_size_usd
         self._min_spacing_bps = min_spacing_bps
         self._adverse_selection_bps = adverse_selection_bps
         self._min_edge_bps = min_edge_bps
+        self._geometric = geometric
 
         self._state: GridState = GridState()
 
@@ -144,11 +146,23 @@ class GridEngine:
         buy_levels: list[GridLevel] = []
         sell_levels: list[GridLevel] = []
 
+        # Geometric spacing: price[i] = mid * (1 - bps/10000)^(i+1)
+        # Linear spacing:     price[i] = mid * (1 - (i+1) * bps/10000)
+        # Geometric is safe — never goes negative regardless of levels/spacing.
+        one = Decimal("1")
+
         for i in range(num_buy_levels):
-            offset = (i + 1) * buy_factor
-            price = (mid_price * (1 - offset)).quantize(
-                Decimal("0.1"), rounding=ROUND_HALF_UP,
-            )
+            if self._geometric:
+                price = (mid_price * (one - buy_factor) ** (i + 1)).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                )
+            else:
+                offset = (i + 1) * buy_factor
+                price = (mid_price * (one - offset)).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                )
+            if price <= 0:
+                break
             qty = self._qty_for_price(price, buy_qty_scale)
             if qty >= MIN_ORDER_BTC:
                 buy_levels.append(GridLevel(
@@ -156,10 +170,15 @@ class GridEngine:
                 ))
 
         for i in range(num_sell_levels):
-            offset = (i + 1) * sell_factor
-            price = (mid_price * (1 + offset)).quantize(
-                Decimal("0.1"), rounding=ROUND_HALF_UP,
-            )
+            if self._geometric:
+                price = (mid_price * (one + sell_factor) ** (i + 1)).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                )
+            else:
+                offset = (i + 1) * sell_factor
+                price = (mid_price * (one + offset)).quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                )
             qty = self._qty_for_price(price, sell_qty_scale)
             if qty >= MIN_ORDER_BTC:
                 sell_levels.append(GridLevel(

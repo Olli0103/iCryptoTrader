@@ -39,7 +39,9 @@ if TYPE_CHECKING:
     from icryptotrader.metrics import MetricsRegistry
     from icryptotrader.notify.telegram import BotSnapshot
     from icryptotrader.strategy.ai_signal import AISignalEngine
+    from icryptotrader.strategy.avellaneda_stoikov import AvellanedaStoikov
     from icryptotrader.strategy.bollinger import BollingerSpacing
+    from icryptotrader.ws.book_manager import OrderBook
 
 from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
@@ -99,6 +101,8 @@ class StrategyLoop:
         bollinger: BollingerSpacing | None = None,
         ai_signal: AISignalEngine | None = None,
         persistence_backend: str = "json",
+        book: OrderBook | None = None,
+        avellaneda_stoikov: AvellanedaStoikov | None = None,
     ) -> None:
         self._fee = fee_model
         self._om = order_manager
@@ -121,6 +125,12 @@ class StrategyLoop:
 
         # Persistence backend
         self._persistence_backend = persistence_backend
+
+        # L2 order book (for OBI and validated mid-price)
+        self._book = book
+
+        # Avellaneda-Stoikov optimal spacing model
+        self._as = avellaneda_stoikov
 
         # Auto-compounding
         self._auto_compound = auto_compound
@@ -246,23 +256,47 @@ class StrategyLoop:
         if rec_sell >= 0:
             num_sell = min(num_sell, rec_sell)
 
-        # 7. Compute delta skew
+        # 7. Compute delta skew (with OBI from book if available)
         limits = self._inv.current_limits()
+        obi = 0.0
+        if self._book is not None and self._book.is_valid:
+            obi = self._book.order_book_imbalance()
+            self._regime.update_order_book_imbalance(obi)
         skew_result = self._skew.compute(
             btc_alloc_pct=snap.btc_allocation_pct,
             target_pct=limits.target_pct,
+            obi=obi,
         )
 
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
-        # Use Bollinger+ATR dynamic spacing if available, else fee-model static
-        base_spacing = self._grid.optimal_spacing_bps()
-        if self._bollinger is not None:
-            self._price_window.append(mid_price)
-            high = max(self._price_window)
-            low = min(self._price_window)
-            bb_state = self._bollinger.update(mid_price, high=high, low=low)
-            if bb_state is not None:
-                base_spacing = bb_state.suggested_spacing_bps
+        fee_floor = self._grid.optimal_spacing_bps()
+
+        # Avellaneda-Stoikov: when enabled, computes optimal spread and
+        # inventory skew in one model, replacing Bollinger + DeltaSkew.
+        if self._as is not None:
+            inv_delta = snap.btc_allocation_pct - limits.target_pct
+            as_result = self._as.compute(
+                volatility_bps=Decimal(str(self._regime.ewma_volatility * 10000)),
+                inventory_delta=Decimal(str(inv_delta)),
+                fee_floor_bps=fee_floor,
+                obi=obi,
+            )
+            base_spacing = as_result.buy_spacing_bps
+            buy_spacing = as_result.buy_spacing_bps
+            sell_spacing = as_result.sell_spacing_bps
+        else:
+            # Fallback: Bollinger+ATR dynamic spacing + DeltaSkew
+            base_spacing = fee_floor
+            if self._bollinger is not None:
+                self._price_window.append(mid_price)
+                high = max(self._price_window)
+                low = min(self._price_window)
+                bb_state = self._bollinger.update(mid_price, high=high, low=low)
+                if bb_state is not None:
+                    base_spacing = bb_state.suggested_spacing_bps
+            buy_spacing, sell_spacing = self._skew.apply_to_spacing(
+                base_spacing, skew_result,
+            )
 
         # Apply AI signal bias to spacing
         ai_bias_bps = Decimal("0")
@@ -272,11 +306,6 @@ class StrategyLoop:
                 ai_bias_bps = sig.suggested_bias_bps * Decimal(
                     str(sig.confidence * self._ai_signal.weight),
                 )
-
-        buy_spacing, sell_spacing = self._skew.apply_to_spacing(
-            base_spacing, skew_result,
-        )
-        # AI bias: positive = bullish → tighter buys, wider sells
         if ai_bias_bps != 0:
             buy_spacing = max(Decimal("5"), buy_spacing - ai_bias_bps)
             sell_spacing = max(Decimal("5"), sell_spacing + ai_bias_bps)
@@ -423,7 +452,9 @@ class StrategyLoop:
             "drawdown_pct": self._risk.drawdown_pct * 100,
             "price_change_1h_pct": 0.0,
             "price_change_24h_pct": 0.0,
-            "book_imbalance": 0.0,
+            "book_imbalance": self._book.order_book_imbalance()
+            if self._book and self._book.is_valid
+            else 0.0,
             "ytd_taxable_gain_eur": float(self._ledger.taxable_gain_ytd()),
         }
 
@@ -485,7 +516,42 @@ class StrategyLoop:
             fills_today=self.fills_today,
             profit_today_usd=self.profit_today_usd,
             eur_usd_rate=self._eur_usd_rate,
+            # Blow-through overhaul fields
+            blow_through_mode=self._tax._blow_through_mode,
+            vault_btc=self._tax.vault_lot_btc(),
+            vault_lock_priority=self._tax._vault_lock_priority,
+            geometric_spacing=getattr(self._grid, "_geometric", True),
+            grid_spacing_bps=self._grid.spacing_bps,
+            btc_price_usd=self._inv.btc_price,
+            twap_budget_remaining_pct=self._twap_budget_pct(),
+            wash_sale_active_lots=len(self._tax._harvest_timestamps),
+            grid_orders=self._grid_order_tuples(),
+            is_paused=self._risk.pause_state.name != "ACTIVE_TRADING",
         )
+
+    def _twap_budget_pct(self) -> float:
+        """Return TWAP budget remaining as a fraction 0..1."""
+        total_usd = self._inv.portfolio_value_usd
+        if total_usd <= 0:
+            return 1.0
+        remaining = self._inv._twap_remaining_usd(total_usd)
+        budget = total_usd * Decimal(str(self._inv._max_rebalance_pct_per_min))
+        if budget <= 0:
+            return 1.0
+        return float(min(remaining / budget, Decimal("1")))
+
+    def _grid_order_tuples(self) -> list[tuple[str, str, str, str]]:
+        """Return grid orders as (side, price, qty, state) string tuples."""
+        orders = []
+        for slot in self._om.slots:
+            if hasattr(slot, "state") and slot.state.name != "EMPTY":
+                orders.append((
+                    slot.side.value,
+                    f"${slot.price:,.1f}" if slot.price else "—",
+                    f"{slot.qty:.6f}" if slot.qty else "—",
+                    slot.state.name.lower(),
+                ))
+        return orders
 
     def _record_tick_metrics(self) -> None:
         """Push tick metrics to the metrics registry."""

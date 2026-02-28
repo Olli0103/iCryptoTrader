@@ -51,30 +51,35 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         headroom_pct=cfg.rate_limit.headroom_pct,
     )
 
-    # Grid engine
+    # Grid engine (geometric spacing prevents negative price crashes)
     grid_engine = GridEngine(
         fee_model=fee_model,
         order_size_usd=cfg.grid.order_size_usd,
         min_spacing_bps=cfg.grid.min_spacing_bps,
+        geometric=cfg.grid.geometric_spacing,
     )
 
-    # Order manager
+    # Order manager (amend threshold preserves queue priority)
     order_manager = OrderManager(
         num_slots=(cfg.grid.levels * 2) or 10,
         rate_limiter=rate_limiter,
         pair=cfg.pair,
         pending_timeout_ms=cfg.ws.pending_ack_timeout_ms,
+        amend_threshold_bps=cfg.grid.amend_threshold_bps,
     )
 
     # FIFO ledger
     ledger = FIFOLedger()
 
-    # Tax agent
+    # Tax agent (blow-through mode, vault lock priority, wash sale cooldown)
     tax_agent = TaxAgent(
         ledger=ledger,
         annual_exemption_eur=cfg.tax.annual_exemption_eur,
         near_threshold_days=cfg.tax.near_threshold_days,
         emergency_dd_pct=cfg.tax.emergency_dd_override_pct,
+        blow_through_mode=cfg.tax.blow_through_mode,
+        vault_lock_priority=cfg.tax.vault_lock_priority,
+        wash_sale_cooldown_hours=cfg.tax.harvest_wash_sale_cooldown_hours,
     )
 
     # Risk manager — pass trailing stop config from cfg
@@ -115,7 +120,10 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
             min_pct=cfg.regime.chaos.btc_min_pct,
         ),
     }
-    inventory = InventoryArbiter(limits=regime_limits)
+    inventory = InventoryArbiter(
+        limits=regime_limits,
+        max_rebalance_pct_per_min=cfg.risk.max_rebalance_pct_per_min,
+    )
 
     # Regime router
     regime_router = RegimeRouter()
@@ -134,6 +142,18 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
             atr_enabled=cfg.bollinger.atr_enabled,
             atr_window=cfg.bollinger.atr_window,
             atr_weight=cfg.bollinger.atr_weight,
+        )
+
+    # Avellaneda-Stoikov optimal spacing (optional — replaces Bollinger + DeltaSkew)
+    as_model = None
+    if cfg.avellaneda_stoikov.enabled:
+        from icryptotrader.strategy.avellaneda_stoikov import AvellanedaStoikov
+
+        as_model = AvellanedaStoikov(
+            gamma=Decimal(str(cfg.avellaneda_stoikov.gamma)),
+            max_spread_bps=cfg.avellaneda_stoikov.max_spread_bps,
+            max_skew_bps=cfg.avellaneda_stoikov.max_skew_bps,
+            obi_sensitivity_bps=cfg.avellaneda_stoikov.obi_sensitivity_bps,
         )
 
     # AI signal engine (optional)
@@ -201,6 +221,11 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
     ledger_path = Path(cfg.ledger_path)
     persistence_backend = cfg.persistence_backend
 
+    # Order book for OBI feed (used by strategy loop for skew and AI context)
+    from icryptotrader.ws.book_manager import OrderBook
+
+    order_book = OrderBook(symbol=cfg.pair)
+
     # Strategy loop
     strategy_loop = StrategyLoop(
         fee_model=fee_model,
@@ -220,6 +245,8 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         bollinger=bollinger,
         ai_signal=ai_signal,
         persistence_backend=persistence_backend,
+        book=order_book,
+        avellaneda_stoikov=as_model,
     )
 
     # Telegram bot (optional)
@@ -265,6 +292,7 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         "hedge_manager": hedge_manager,
         "web_dashboard": web_dashboard,
         "pair_manager": pair_manager,
+        "order_book": order_book,
     }
 
 
@@ -330,6 +358,42 @@ async def _run_bot(cfg: Config) -> None:
     # Run startup sequence
     await lm.startup()
 
+    # Event-driven tick: wake on WS events instead of fixed 100ms polling.
+    # The tick_event is set by WS callbacks (book update, trade, fill, balance)
+    # and the loop awaits it with a 1-second max timeout fallback.
+    tick_event = asyncio.Event()
+    order_book = c["order_book"]
+
+    def _on_book_msg(msg: object) -> None:
+        """Route book channel data to OrderBook and signal tick."""
+        from icryptotrader.ws.ws_codec import WSMessage
+
+        assert isinstance(msg, WSMessage)
+        if not msg.data:
+            return
+        book_data = msg.data[0] if isinstance(msg.data, list) else msg.data
+        if msg.data_type == "snapshot":
+            order_book.apply_snapshot(book_data)
+        else:
+            order_book.apply_update(book_data)
+        tick_event.set()
+
+    def _on_trade_msg(_msg: object) -> None:
+        """Signal tick on public trade."""
+        tick_event.set()
+
+    def _on_execution_msg(_msg: object) -> None:
+        """Signal tick on private execution (fill, order status)."""
+        tick_event.set()
+
+    # Register WS callbacks that drive the event loop
+    ws_public.on_channel("book", _on_book_msg)
+    ws_public.on_channel("trade", _on_trade_msg)
+    ws_private.on_execution(_on_execution_msg)
+
+    # Subscribe to L2 book channel for OBI and validated mid-price
+    ws_public.subscribe("book", symbol=[cfg.pair], depth=10)
+
     # AI signal background loop
     ai_task = None
     if ai_signal:
@@ -337,11 +401,16 @@ async def _run_bot(cfg: Config) -> None:
             _ai_signal_loop(ai_signal, strategy_loop),
         )
 
-    logger.info("Bot running. Press Ctrl+C to stop.")
+    logger.info("Bot running (event-driven). Press Ctrl+C to stop.")
 
-    # Main tick loop
+    # Main tick loop — event-driven with timeout fallback
     try:
         while not lm.is_shutting_down:
+            # Wait for a market event or 1-second timeout (periodic fallback)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(tick_event.wait(), timeout=1.0)
+            tick_event.clear()
+
             try:
                 price = c["inventory"].btc_price
                 if price > 0:
@@ -386,8 +455,6 @@ async def _run_bot(cfg: Config) -> None:
                             await ws_private.send_cancel_order(**params)
             except Exception:
                 logger.exception("Tick error")
-
-            await asyncio.sleep(0.1)  # 100ms tick interval
     except asyncio.CancelledError:
         pass
 
