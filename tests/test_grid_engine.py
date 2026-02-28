@@ -201,6 +201,61 @@ class TestMetrics:
         assert edge > 0  # Grid spacing should be profitable
 
 
+class TestPriceTickSize:
+    def test_default_tick_is_one_decimal(self) -> None:
+        """Default tick size of 0.1 works for BTC/USD."""
+        fm = FeeModel(volume_30d_usd=0)
+        engine = GridEngine(fee_model=fm)
+        state = engine.compute_grid(
+            mid_price=Decimal("85000"),
+            num_buy_levels=1,
+            num_sell_levels=0,
+            spacing_bps=Decimal("100"),
+        )
+        price = state.buy_levels[0].price
+        # Should be quantized to 0.1
+        assert price == price.quantize(Decimal("0.1"))
+
+    def test_custom_tick_for_eth(self) -> None:
+        """ETH-like pair with $0.01 tick size."""
+        fm = FeeModel(volume_30d_usd=0)
+        engine = GridEngine(
+            fee_model=fm,
+            order_size_usd=Decimal("500"),
+            price_tick_size=Decimal("0.01"),
+        )
+        state = engine.compute_grid(
+            mid_price=Decimal("3200.55"),
+            num_buy_levels=1,
+            num_sell_levels=1,
+            spacing_bps=Decimal("100"),
+        )
+        buy_price = state.buy_levels[0].price
+        sell_price = state.sell_levels[0].price
+        # Should be quantized to 0.01
+        assert buy_price == buy_price.quantize(Decimal("0.01"))
+        assert sell_price == sell_price.quantize(Decimal("0.01"))
+
+    def test_custom_tick_for_xrp(self) -> None:
+        """XRP-like pair with $0.0001 tick size."""
+        fm = FeeModel(volume_30d_usd=0)
+        engine = GridEngine(
+            fee_model=fm,
+            order_size_usd=Decimal("500"),
+            price_tick_size=Decimal("0.0001"),
+        )
+        state = engine.compute_grid(
+            mid_price=Decimal("0.5432"),
+            num_buy_levels=1,
+            num_sell_levels=1,
+            spacing_bps=Decimal("100"),
+        )
+        buy_price = state.buy_levels[0].price
+        sell_price = state.sell_levels[0].price
+        assert buy_price == buy_price.quantize(Decimal("0.0001"))
+        assert sell_price == sell_price.quantize(Decimal("0.0001"))
+
+
 class TestMinOrderSize:
     def test_tiny_price_filtered(self) -> None:
         """At extremely high prices, small USD orders produce sub-minimum qty."""

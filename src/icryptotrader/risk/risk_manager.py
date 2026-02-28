@@ -207,6 +207,15 @@ class RiskManager:
         """
         now = time.monotonic()
 
+        # Always record the current price and prune stale entries first.
+        # This ensures the deque stays fresh even during a freeze, so the
+        # hysteresis check compares against recent (post-crash) prices
+        # rather than stale pre-crash entries.
+        self._price_history.append((now, price))
+        cutoff = now - self._velocity_window_sec
+        while self._price_history and self._price_history[0][0] < cutoff:
+            self._price_history.popleft()
+
         # Check if we're in cooldown
         if self._velocity_frozen:
             if now >= self._velocity_unfreeze_at:
@@ -224,14 +233,6 @@ class RiskManager:
                 logger.info("Price velocity circuit breaker: unfrozen (hysteresis passed)")
             else:
                 return True
-
-        # Record price
-        self._price_history.append((now, price))
-
-        # Prune old entries from the left (deque is ordered by time)
-        cutoff = now - self._velocity_window_sec
-        while self._price_history and self._price_history[0][0] < cutoff:
-            self._price_history.popleft()
 
         if len(self._price_history) < 2:
             return False
@@ -271,6 +272,25 @@ class RiskManager:
         self._pause_state = PauseState.ACTIVE_TRADING
         self._tax_locked = False
         logger.warning("Risk: forced return to ACTIVE_TRADING")
+
+    def record_deposit(self, amount_usd: Decimal) -> None:
+        """Adjust baseline up after an external deposit.
+
+        Without this, depositing new capital would inflate portfolio growth
+        relative to _initial_portfolio, causing the trailing stop to
+        tighten erroneously.
+        """
+        if amount_usd <= 0:
+            return
+        old_initial = self._initial_portfolio
+        self._initial_portfolio += amount_usd
+        self._hwm += amount_usd
+        logger.info(
+            "Baseline adjusted for deposit: initial %.2f → %.2f, "
+            "HWM %.2f → %.2f (deposited %.2f USD)",
+            old_initial, self._initial_portfolio,
+            self._hwm - amount_usd, self._hwm, amount_usd,
+        )
 
     def record_withdrawal(self, amount_usd: Decimal) -> None:
         """Adjust HWM down after an external withdrawal (e.g., tax payment).
