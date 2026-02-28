@@ -31,7 +31,8 @@ class GridConfig:
     auto_compound: bool = False  # Reinvest profits into order size
     compound_base_usd: Decimal = Decimal("5000")  # Starting portfolio for scaling
     geometric_spacing: bool = True  # Geometric (safe) vs linear (can go negative)
-    amend_threshold_bps: Decimal = Decimal("3")  # Min price move before amending
+    amend_threshold_bps: Decimal = Decimal("10")  # Min bps move before amending (queue priority)
+    price_tick_size: Decimal = Decimal("0.1")  # BTC/USD = 0.1, ETH/USD = 0.01, XRP/USD = 0.0001
 
 
 @dataclass
@@ -56,7 +57,7 @@ class TaxConfig:
     harvest_min_loss_eur: Decimal = Decimal("50")
     harvest_max_per_day: int = 3
     harvest_target_net_eur: Decimal = Decimal("800")
-    blow_through_mode: bool = False  # Skip Freigrenze gating, maximize gross
+    blow_through_mode: bool = True  # Skip Freigrenze gating, maximize gross profit
     harvest_wash_sale_cooldown_hours: int = 24  # §42 AO safe harbor
     vault_lock_priority: bool = True  # Prioritize selling >365-day lots
 

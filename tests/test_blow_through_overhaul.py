@@ -553,9 +553,10 @@ class TestNewConfigFields:
         from icryptotrader.config import Config
         cfg = Config()
         assert cfg.grid.geometric_spacing is True
-        assert cfg.grid.amend_threshold_bps == Decimal("3")
+        assert cfg.grid.amend_threshold_bps == Decimal("10")
+        assert cfg.grid.price_tick_size == Decimal("0.1")
         assert cfg.risk.max_rebalance_pct_per_min == 0.01
-        assert cfg.tax.blow_through_mode is False
+        assert cfg.tax.blow_through_mode is True
         assert cfg.tax.vault_lock_priority is True
         assert cfg.tax.harvest_wash_sale_cooldown_hours == 24
 
