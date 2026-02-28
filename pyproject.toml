@@ -31,6 +31,20 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-v --tb=short"
 
+[tool.coverage.run]
+source = ["icryptotrader"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.",
+    "pass",
+    "\\.\\.\\.",
+]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
@@ -39,9 +53,23 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
 
+[tool.ruff.lint.per-file-ignores]
+# Embedded HTML/JS string has long lines by necessity
+"src/icryptotrader/web/dashboard.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = [
+    "orjson",
+    "httpx",
+    "httpx.*",
+    "websockets",
+    "websockets.*",
+]
+ignore_missing_imports = true

@@ -111,7 +111,7 @@ class RegimeRouter:
     @property
     def ewma_volatility(self) -> float:
         """EWMA volatility estimate (tick-level, not annualized)."""
-        return self._ewma_var ** 0.5
+        return float(self._ewma_var ** 0.5)
 
     def update_price(self, price: Decimal) -> None:
         """Update with a new price observation. Call on every tick."""
@@ -143,8 +143,8 @@ class RegimeRouter:
         """Record a trade for VWAP calculation."""
         self._trade_history.append((price, quantity))
         # Recompute VWAP
-        total_pq = sum(p * q for p, q in self._trade_history)
-        total_q = sum(q for _, q in self._trade_history)
+        total_pq = sum((p * q for p, q in self._trade_history), Decimal("0"))
+        total_q = sum((q for _, q in self._trade_history), Decimal("0"))
         if total_q > 0:
             self._vwap_value = total_pq / total_q
 

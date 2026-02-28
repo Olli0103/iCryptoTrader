@@ -152,7 +152,7 @@ def encode_subscribe(
     }
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))
 
 
 def encode_unsubscribe(
@@ -167,7 +167,7 @@ def encode_unsubscribe(
     }
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))
 
 
 def encode_add_order(
@@ -199,7 +199,7 @@ def encode_add_order(
     msg: dict[str, Any] = {"method": "add_order", "params": params}
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))
 
 
 def encode_amend_order(
@@ -219,7 +219,7 @@ def encode_amend_order(
     msg: dict[str, Any] = {"method": "amend_order", "params": params}
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))
 
 
 def encode_cancel_order(
@@ -236,7 +236,7 @@ def encode_cancel_order(
     msg: dict[str, Any] = {"method": "cancel_order", "params": params}
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))
 
 
 def encode_cancel_all(req_id: int | None = None) -> bytes:
@@ -244,7 +244,7 @@ def encode_cancel_all(req_id: int | None = None) -> bytes:
     msg: dict[str, Any] = {"method": "cancel_all"}
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))
 
 
 def encode_cancel_after(timeout_sec: int, req_id: int | None = None) -> bytes:
@@ -255,7 +255,7 @@ def encode_cancel_after(timeout_sec: int, req_id: int | None = None) -> bytes:
     }
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))
 
 
 def encode_ping(req_id: int | None = None) -> bytes:
@@ -263,4 +263,4 @@ def encode_ping(req_id: int | None = None) -> bytes:
     msg: dict[str, Any] = {"method": "ping"}
     if req_id is not None:
         msg["req_id"] = req_id
-    return orjson.dumps(msg)
+    return bytes(orjson.dumps(msg))

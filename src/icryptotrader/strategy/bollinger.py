@@ -117,7 +117,7 @@ class BollingerSpacing:
             return None
 
         # SMA
-        sma = sum(self._prices) / len(self._prices)
+        sma = sum(self._prices, Decimal("0")) / len(self._prices)
 
         if sma <= 0:
             self._state = None
@@ -125,7 +125,7 @@ class BollingerSpacing:
 
         # Standard deviation
         variance = sum(
-            (p - sma) ** 2 for p in self._prices
+            ((p - sma) ** 2 for p in self._prices), Decimal("0"),
         ) / len(self._prices)
         std_dev = Decimal(str(math.sqrt(float(variance))))
 
@@ -146,7 +146,7 @@ class BollingerSpacing:
             atr_bps = (self._atr_value / sma) * 10000
             atr_spacing = atr_bps * self._spacing_scale
             w = Decimal(str(self._atr_weight))
-            raw_spacing = (1 - w) * bb_spacing + w * atr_spacing
+            raw_spacing = (Decimal("1") - w) * bb_spacing + w * atr_spacing
         else:
             raw_spacing = bb_spacing
 
@@ -192,7 +192,7 @@ class BollingerSpacing:
             return
 
         # Simple average of true ranges (SMA-based ATR)
-        self._atr_value = sum(true_ranges) / len(true_ranges)
+        self._atr_value = sum(true_ranges, Decimal("0")) / len(true_ranges)
 
     def reset(self) -> None:
         """Clear all state."""

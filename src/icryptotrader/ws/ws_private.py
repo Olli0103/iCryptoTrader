@@ -375,7 +375,7 @@ class WSPrivate:
                         f"GetWebSocketsToken failed: {result['error']}"
                     )
 
-                return result["result"]["token"]
+                return str(result["result"]["token"])
 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code < 500:
