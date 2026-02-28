@@ -27,6 +27,7 @@ all subsystems. Each tick:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import deque
@@ -47,6 +48,7 @@ from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
 from icryptotrader.order.order_manager import Action, DesiredLevel, OrderManager
 from icryptotrader.risk.delta_skew import DeltaSkew  # noqa: TC001
+from icryptotrader.risk.hedge_manager import HedgeAction  # noqa: TC001
 from icryptotrader.risk.risk_manager import RiskManager  # noqa: TC001
 from icryptotrader.strategy.grid_engine import GridEngine  # noqa: TC001
 from icryptotrader.strategy.regime_router import RegimeRouter  # noqa: TC001
@@ -140,6 +142,13 @@ class StrategyLoop:
         # High/low tracker for Bollinger ATR feed
         self._price_window: deque[Decimal] = deque(maxlen=50)
 
+        # Hedge action from HedgeManager (set before each tick)
+        self._hedge_action: HedgeAction | None = None
+
+        # Price history for 1h/24h change (P1-5)
+        self._price_history_1h: deque[tuple[float, Decimal]] = deque(maxlen=3600)
+        self._price_history_24h: deque[tuple[float, Decimal]] = deque(maxlen=86400)
+
         # Metrics
         self.ticks: int = 0
         self.commands_issued: int = 0
@@ -154,6 +163,10 @@ class StrategyLoop:
         """Update EUR/USD rate from ECB service."""
         self._eur_usd_rate = rate
 
+    def set_hedge_action(self, action: HedgeAction | None) -> None:
+        """Set the current hedge action from HedgeManager."""
+        self._hedge_action = action
+
     def load_ledger(self) -> None:
         """Load FIFO ledger from disk at startup."""
         if not self._ledger_path:
@@ -165,7 +178,22 @@ class StrategyLoop:
             self._ledger.load(self._ledger_path)
 
     def save_ledger(self) -> None:
-        """Save FIFO ledger to disk (called automatically after fills)."""
+        """Save FIFO ledger to disk (called automatically after fills).
+
+        When called from the async event loop, saves in a thread executor
+        to avoid blocking. Falls back to synchronous save if no loop is running.
+        """
+        if not self._ledger_path:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, self._save_ledger_sync)
+        except RuntimeError:
+            # No running loop, save synchronously
+            self._save_ledger_sync()
+
+    def _save_ledger_sync(self) -> None:
+        """Synchronous ledger save (used by executor and direct calls)."""
         if not self._ledger_path:
             return
         if self._persistence_backend == "sqlite":
@@ -206,6 +234,11 @@ class StrategyLoop:
         # 1. Update market data
         self._inv.update_price(mid_price)
         self._regime.update_price(mid_price)
+
+        # Track price history for 1h/24h change calculations (P1-5)
+        now_ts = time.time()
+        self._price_history_1h.append((now_ts, mid_price))
+        self._price_history_24h.append((now_ts, mid_price))
 
         # 2. Check price velocity circuit breaker
         if self._risk.check_price_velocity(mid_price):
@@ -256,6 +289,14 @@ class StrategyLoop:
         if rec_sell >= 0:
             num_sell = min(num_sell, rec_sell)
 
+        # P0-3: Apply hedge action (buy level cap + sell boost + spacing tighten)
+        sell_spacing_tighten = 0.0
+        if self._hedge_action is not None and self._hedge_action.active:
+            if self._hedge_action.buy_level_cap is not None:
+                num_buy = min(num_buy, self._hedge_action.buy_level_cap)
+            num_sell = num_sell + self._hedge_action.sell_level_boost
+            sell_spacing_tighten = self._hedge_action.sell_spacing_tighten_pct
+
         # 7. Compute delta skew (with OBI from book if available)
         limits = self._inv.current_limits()
         obi = 0.0
@@ -297,6 +338,11 @@ class StrategyLoop:
             buy_spacing, sell_spacing = self._skew.apply_to_spacing(
                 base_spacing, skew_result,
             )
+
+        # Apply hedge sell spacing tightening (inverse_grid strategy)
+        if sell_spacing_tighten > 0:
+            sell_spacing = sell_spacing * Decimal(str(1.0 - sell_spacing_tighten))
+            sell_spacing = max(Decimal("1"), sell_spacing)
 
         # Apply AI signal bias to spacing
         ai_bias_bps = Decimal("0")
@@ -450,13 +496,33 @@ class StrategyLoop:
             "regime": regime_decision.regime.value,
             "btc_allocation_pct": snap.btc_allocation_pct * 100,
             "drawdown_pct": self._risk.drawdown_pct * 100,
-            "price_change_1h_pct": 0.0,
-            "price_change_24h_pct": 0.0,
+            "price_change_1h_pct": self._compute_price_change(self._price_history_1h, 3600),
+            "price_change_24h_pct": self._compute_price_change(self._price_history_24h, 86400),
             "book_imbalance": self._book.order_book_imbalance()
             if self._book and self._book.is_valid
             else 0.0,
             "ytd_taxable_gain_eur": float(self._ledger.taxable_gain_ytd()),
         }
+
+    @staticmethod
+    def _compute_price_change(
+        history: deque[tuple[float, Decimal]], window_sec: int,
+    ) -> float:
+        """Compute price change percentage over a time window."""
+        if len(history) < 2:
+            return 0.0
+        now = history[-1][0]
+        cutoff = now - window_sec
+        # Find oldest entry within window
+        oldest_price = history[0][1]
+        for ts, price in history:
+            if ts >= cutoff:
+                oldest_price = price
+                break
+        current_price = history[-1][1]
+        if oldest_price <= 0:
+            return 0.0
+        return float((current_price - oldest_price) / oldest_price) * 100
 
     def bot_snapshot(self) -> BotSnapshot:
         """Provide a snapshot for the Telegram bot (BotDataProvider).

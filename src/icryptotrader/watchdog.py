@@ -5,19 +5,19 @@ Runs as a background asyncio task. Checks:
   - WebSocket connection alive
   - Memory usage (detect leaks)
 
-If unhealthy for N consecutive checks → log critical + attempt reconnect.
-If unrecoverable → clean exit(1) for Docker ``restart: unless-stopped``.
+If unhealthy for N consecutive checks → log critical + trigger graceful shutdown
+via the LifecycleManager (saves ledger, cancels orders, closes WS).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from icryptotrader.lifecycle import LifecycleManager
     from icryptotrader.strategy.strategy_loop import StrategyLoop
     from icryptotrader.ws.ws_private import WSPrivate
 
@@ -37,7 +37,7 @@ class Watchdog:
     """Background health monitor for the trading bot.
 
     Usage:
-        wd = Watchdog(strategy_loop=loop, ws_private=ws2)
+        wd = Watchdog(strategy_loop=loop, ws_private=ws2, lifecycle_manager=lm)
         task = asyncio.create_task(wd.run())
         # ... later ...
         wd.stop()
@@ -47,12 +47,14 @@ class Watchdog:
         self,
         strategy_loop: StrategyLoop,
         ws_private: WSPrivate,
+        lifecycle_manager: LifecycleManager | None = None,
         check_interval: float = CHECK_INTERVAL_SEC,
         max_tick_age: float = MAX_TICK_AGE_SEC,
         max_failures: int = MAX_FAILURES,
     ) -> None:
         self._strategy = strategy_loop
         self._ws = ws_private
+        self._lm = lifecycle_manager
         self._interval = check_interval
         self._max_tick_age = max_tick_age
         self._max_failures = max_failures
@@ -78,7 +80,7 @@ class Watchdog:
                 await asyncio.sleep(self._interval)
                 if not self._running:
                     break
-                self._check_health()
+                await self._check_health()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -86,7 +88,7 @@ class Watchdog:
 
         logger.info("Watchdog stopped")
 
-    def _check_health(self) -> None:
+    async def _check_health(self) -> None:
         """Run one health check cycle."""
         self.checks += 1
         issues: list[str] = []
@@ -123,12 +125,14 @@ class Watchdog:
 
             if self._consecutive_failures >= self._max_failures:
                 logger.critical(
-                    "Watchdog: %d consecutive failures, triggering exit for restart",
+                    "Watchdog: %d consecutive failures, triggering graceful shutdown",
                     self._consecutive_failures,
                 )
                 self._running = False
-                # Exit with non-zero for Docker restart
-                sys.exit(1)
+                # Trigger graceful shutdown (saves ledger, cancels orders)
+                # instead of sys.exit(1) which bypasses cleanup
+                if self._lm is not None:
+                    await self._lm.shutdown()
         else:
             if self._consecutive_failures > 0:
                 self.recoveries += 1

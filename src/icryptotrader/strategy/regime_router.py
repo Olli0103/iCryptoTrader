@@ -13,6 +13,7 @@ Output: Regime enum + allocation parameters for the Inventory Arbiter.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -200,7 +201,6 @@ class RegimeRouter:
 
         # Simple return over the elapsed period, scaled to daily equivalent
         ret = abs(float((newest_price - oldest_price) / oldest_price))
-        import math
         daily_scale = math.sqrt(86400.0 / elapsed)
         return ret * daily_scale
 

@@ -118,10 +118,33 @@ class FIFOLedger:
     Primary data structure for tax-aware trading. Lots are always ordered
     by purchase_timestamp ascending (FIFO). Every sell consumes from the
     oldest lots first.
+
+    Aggregates (total_btc, tax_free_btc) are cached and invalidated on mutation
+    to avoid O(n) scans on every strategy tick.
     """
 
     def __init__(self) -> None:
         self._lots: list[TaxLot] = []
+        self._cache_valid = False
+        self._cached_total_btc: Decimal = Decimal("0")
+        self._cached_tax_free_btc: Decimal = Decimal("0")
+
+    def _invalidate_cache(self) -> None:
+        self._cache_valid = False
+
+    def _ensure_cache(self) -> None:
+        if self._cache_valid:
+            return
+        total = Decimal("0")
+        tax_free = Decimal("0")
+        for lot in self._lots:
+            if lot.status != LotStatus.CLOSED:
+                total += lot.remaining_qty_btc
+                if lot.is_tax_free:
+                    tax_free += lot.remaining_qty_btc
+        self._cached_total_btc = total
+        self._cached_tax_free_btc = tax_free
+        self._cache_valid = True
 
     @property
     def lots(self) -> list[TaxLot]:
@@ -163,6 +186,7 @@ class FIFOLedger:
         self._lots.append(lot)
         self._lots.sort(key=lambda x: x.purchase_timestamp)
 
+        self._invalidate_cache()
         logger.info(
             "FIFO lot added: %s BTC @ $%s (lot %s, %s)",
             quantity_btc, purchase_price_usd, lot.lot_id[:8], source_engine,
@@ -241,6 +265,7 @@ class FIFOLedger:
             disposals.append(disposal)
             remaining_to_sell -= sell_from_lot
 
+        self._invalidate_cache()
         total_gain = sum(d.gain_loss_eur for d in disposals)
         taxable_count = sum(1 for d in disposals if d.is_taxable)
         logger.info(
@@ -252,18 +277,12 @@ class FIFOLedger:
     # --- Query methods ---
 
     def total_btc(self) -> Decimal:
-        return sum(
-            (lot.remaining_qty_btc for lot in self._lots if lot.status != LotStatus.CLOSED),
-            Decimal("0"),
-        )
+        self._ensure_cache()
+        return self._cached_total_btc
 
     def tax_free_btc(self) -> Decimal:
-        return sum(
-            (lot.remaining_qty_btc
-            for lot in self._lots
-            if lot.status != LotStatus.CLOSED and lot.is_tax_free),
-            Decimal("0"),
-        )
+        self._ensure_cache()
+        return self._cached_tax_free_btc
 
     def locked_btc(self) -> Decimal:
         """BTC that cannot be sold tax-free (held < 365 days)."""
@@ -391,6 +410,7 @@ class FIFOLedger:
             data = json.load(f)
         self._lots = [_dict_to_lot(d) for d in data]
         self._lots.sort(key=lambda x: x.purchase_timestamp)
+        self._invalidate_cache()
         logger.info("FIFO ledger loaded from %s (%d lots)", path, len(self._lots))
 
     def save_sqlite(self, path: Path) -> None:
@@ -452,6 +472,7 @@ class FIFOLedger:
                 _dict_to_lot(json.loads(row[0])) for row in rows
             ]
             self._lots.sort(key=lambda x: x.purchase_timestamp)
+            self._invalidate_cache()
             logger.info(
                 "FIFO ledger loaded from SQLite %s (%d lots)",
                 path, len(self._lots),
