@@ -5,9 +5,12 @@ Two-layer architecture:
   2. TelegramBot: interactive command/button handler with long polling
 
 The bot provides:
-  - Inline keyboard menus (no /commands needed, though supported)
+  - Dashboard: at-a-glance overview of portfolio, risk, tax, and grid
+  - Quick Actions: pause/resume, trigger harvest, reset risk, toggle modes
   - Portfolio status, lot viewer, P&L, tax reports, AI signal status
-  - Sub-menus with back navigation
+  - Grid order view with spacing and order details
+  - Sub-menus with back navigation and refresh buttons
+  - Blow-through overhaul data (vault lots, TWAP, wash sale status)
   - Push notifications for trading events
 """
 
@@ -19,9 +22,12 @@ import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +43,16 @@ class BotDataProvider(Protocol):
     """Protocol for querying current bot state."""
 
     def bot_snapshot(self) -> BotSnapshot: ...
+
+
+class BotActionProvider(Protocol):
+    """Protocol for executing bot actions from Telegram buttons."""
+
+    async def action_pause_trading(self) -> str: ...
+    async def action_resume_trading(self) -> str: ...
+    async def action_trigger_harvest(self) -> str: ...
+    async def action_reset_risk(self) -> str: ...
+    async def action_toggle_blow_through(self) -> str: ...
 
 
 @dataclass
@@ -89,6 +105,22 @@ class BotSnapshot:
 
     # EUR/USD
     eur_usd_rate: Decimal = Decimal("1.08")
+
+    # Blow-through overhaul fields
+    blow_through_mode: bool = False
+    vault_btc: Decimal = Decimal("0")
+    vault_lock_priority: bool = False
+    geometric_spacing: bool = True
+    grid_spacing_bps: Decimal = Decimal("0")
+    btc_price_usd: Decimal = Decimal("0")
+    twap_budget_remaining_pct: float = 1.0
+    wash_sale_active_lots: int = 0
+
+    # Grid order details (list of (side, price, qty, state) tuples as strings)
+    grid_orders: list[tuple[str, str, str, str]] = field(default_factory=list)
+
+    # Trading state
+    is_paused: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +335,10 @@ class TelegramNotifier:
 
 # Menu layouts
 MAIN_MENU = _kb([
-    [("\U0001f4ca Status", "menu:status"), ("\U0001f4c8 P&L", "menu:pnl")],
-    [("\U0001f4b0 Lots", "menu:lots"), ("\U0001f4cb Tax", "menu:tax")],
-    [("\U0001f916 AI Signal", "menu:ai"), ("\u2699\ufe0f Settings", "menu:settings")],
+    [("\U0001f3e0 Dashboard", "menu:dashboard"), ("\U0001f4ca Status", "menu:status")],
+    [("\U0001f4c8 P&L", "menu:pnl"), ("\U0001f4b0 Lots", "menu:lots")],
+    [("\U0001f4cb Tax", "menu:tax"), ("\U0001f916 AI Signal", "menu:ai")],
+    [("\u26a1 Aktionen", "menu:actions"), ("\u2699\ufe0f Settings", "menu:settings")],
 ])
 
 LOTS_MENU = _kb([
@@ -327,11 +360,21 @@ TAX_MENU = _kb([
     [("\U0001f4ca Jahresbericht", "tax:summary")],
     [("\U0001f33e Harvest Empfehlung", "tax:harvest")],
     [("\U0001f512 Freigrenze Status", "tax:freigrenze")],
+    [("\U0001f3e6 Vault & Blow-Through", "tax:vault")],
+    [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
+])
+
+ACTIONS_MENU = _kb([
+    [("\u23ef\ufe0f Pause/Resume", "action:toggle_pause")],
+    [("\U0001f33e Harvest jetzt", "action:harvest")],
+    [("\U0001f504 Risk Reset", "action:reset_risk")],
+    [("\U0001f4a8 Blow-Through Modus", "action:toggle_blow_through")],
     [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
 ])
 
 SETTINGS_MENU = _kb([
     [("\U0001f50d Bot-Info", "settings:info")],
+    [("\U0001f4ca Grid-Status", "settings:grid")],
     [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
 ])
 
@@ -370,6 +413,13 @@ class TelegramBot:
     _lot_viewer_fn: Any = field(init=False, default=None, repr=False)
     _tax_report_fn: Any = field(init=False, default=None, repr=False)
     _harvest_fn: Any = field(init=False, default=None, repr=False)
+    _action_provider: BotActionProvider | None = field(
+        init=False, default=None, repr=False,
+    )
+    # Async action callbacks (alternative to full provider protocol)
+    _action_callbacks: dict[
+        str, Callable[[], Coroutine[Any, Any, str]]
+    ] = field(init=False, default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self._notifier = TelegramNotifier(
@@ -398,6 +448,21 @@ class TelegramBot:
     def set_harvest_provider(self, fn: Any) -> None:
         """Set harvest recommendation callable: () -> list."""
         self._harvest_fn = fn
+
+    def set_action_provider(self, provider: BotActionProvider) -> None:
+        """Set action provider for executing commands from Telegram."""
+        self._action_provider = provider
+
+    def set_action_callback(
+        self,
+        name: str,
+        fn: Callable[[], Coroutine[Any, Any, str]],
+    ) -> None:
+        """Register an async action callback by name.
+
+        Supported names: toggle_pause, harvest, reset_risk, toggle_blow_through.
+        """
+        self._action_callbacks[name] = fn
 
     async def start(self) -> None:
         """Start the long-polling loop in the background."""
@@ -502,11 +567,13 @@ class TelegramBot:
         handlers: dict[str, Any] = {
             "/start": self._cmd_start,
             "/menu": self._cmd_start,
+            "/dashboard": self._cmd_dashboard,
             "/status": self._cmd_status,
             "/lots": self._cmd_lots_menu,
             "/pnl": self._cmd_pnl_menu,
             "/tax": self._cmd_tax_menu,
             "/ai": self._cmd_ai,
+            "/grid": self._cmd_grid,
             "/help": self._cmd_help,
         }
 
@@ -525,14 +592,30 @@ class TelegramBot:
             reply_markup=MAIN_MENU,
         )
 
+    async def _cmd_dashboard(self) -> None:
+        text = self._format_dashboard()
+        await self._notifier.send(text, reply_markup=_kb([
+            [("\U0001f504 Aktualisieren", "menu:dashboard")],
+            [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
+        ]))
+
+    async def _cmd_grid(self) -> None:
+        text = self._format_grid_orders()
+        await self._notifier.send(text, reply_markup=_kb([
+            [("\U0001f504 Aktualisieren", "settings:grid")],
+            [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
+        ]))
+
     async def _cmd_help(self) -> None:
         await self._notifier.send(
             "<b>Verf\u00fcgbare Befehle</b>\n\n"
             "/start \u2014 Hauptmen\u00fc\n"
+            "/dashboard \u2014 \u00dcbersicht\n"
             "/status \u2014 Portfolio-Status\n"
             "/lots \u2014 FIFO-Lots anzeigen\n"
             "/pnl \u2014 Gewinn/Verlust\n"
             "/tax \u2014 Steuerbericht\n"
+            "/grid \u2014 Grid-Orders\n"
             "/ai \u2014 AI-Signal Status\n"
             "/help \u2014 Diese Hilfe\n\n"
             "<i>Oder nutze einfach die Buttons!</i>",
@@ -586,8 +669,11 @@ class TelegramBot:
         # Acknowledge immediately (dismisses loading spinner)
         await self._notifier.answer_callback(cq_id)
 
-        # Build response based on callback data
-        text, markup = self._route_callback(data)
+        # Handle async actions (these need await)
+        if data.startswith("action:"):
+            text, markup = await self._handle_action(data)
+        else:
+            text, markup = self._route_callback(data)
 
         if text:
             await self._notifier.edit_message(
@@ -609,9 +695,19 @@ class TelegramBot:
                 MAIN_MENU,
             )
 
-        # Status
+        # Dashboard
+        if data == "menu:dashboard":
+            return self._format_dashboard(), _kb([
+                [("\U0001f504 Aktualisieren", "menu:dashboard")],
+                [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
+            ])
+
+        # Status with refresh
         if data == "menu:status":
-            return self._format_status(), BACK_BUTTON
+            return self._format_status(), _kb([
+                [("\U0001f504 Aktualisieren", "menu:status")],
+                [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
+            ])
 
         # P&L menu
         if data == "menu:pnl":
@@ -637,6 +733,10 @@ class TelegramBot:
                 TAX_MENU,
             )
 
+        # Actions menu
+        if data == "menu:actions":
+            return self._format_actions_menu(), ACTIONS_MENU
+
         # Settings menu
         if data == "menu:settings":
             return (
@@ -647,7 +747,10 @@ class TelegramBot:
 
         # AI Signal
         if data == "menu:ai":
-            return self._format_ai(), BACK_BUTTON
+            return self._format_ai(), _kb([
+                [("\U0001f504 Aktualisieren", "menu:ai")],
+                [("\u25c0\ufe0f Zur\u00fcck", "back:main")],
+            ])
 
         # Lot sub-views
         if data == "lots:table":
@@ -663,15 +766,17 @@ class TelegramBot:
                 [[("\u25c0\ufe0f Lots", "menu:lots")]],
             )
         if data == "lots:summary":
-            return self._format_lots_summary(), _kb(
-                [[("\u25c0\ufe0f Lots", "menu:lots")]],
-            )
+            return self._format_lots_summary(), _kb([
+                [("\U0001f504 Aktualisieren", "lots:summary")],
+                [("\u25c0\ufe0f Lots", "menu:lots")],
+            ])
 
         # P&L sub-views
         if data == "pnl:daily":
-            return self._format_pnl_daily(), _kb(
-                [[("\u25c0\ufe0f P&L", "menu:pnl")]],
-            )
+            return self._format_pnl_daily(), _kb([
+                [("\U0001f504 Aktualisieren", "pnl:daily")],
+                [("\u25c0\ufe0f P&L", "menu:pnl")],
+            ])
         if data == "pnl:ytd":
             return self._format_pnl_ytd(), _kb(
                 [[("\u25c0\ufe0f P&L", "menu:pnl")]],
@@ -691,17 +796,61 @@ class TelegramBot:
                 [[("\u25c0\ufe0f Steuer", "menu:tax")]],
             )
         if data == "tax:freigrenze":
-            return self._format_tax_freigrenze(), _kb(
-                [[("\u25c0\ufe0f Steuer", "menu:tax")]],
-            )
+            return self._format_tax_freigrenze(), _kb([
+                [("\U0001f504 Aktualisieren", "tax:freigrenze")],
+                [("\u25c0\ufe0f Steuer", "menu:tax")],
+            ])
+        if data == "tax:vault":
+            return self._format_tax_vault(), _kb([
+                [("\U0001f504 Aktualisieren", "tax:vault")],
+                [("\u25c0\ufe0f Steuer", "menu:tax")],
+            ])
 
         # Settings sub-views
         if data == "settings:info":
             return self._format_settings_info(), _kb(
                 [[("\u25c0\ufe0f Einstellungen", "menu:settings")]],
             )
+        if data == "settings:grid":
+            return self._format_grid_orders(), _kb([
+                [("\U0001f504 Aktualisieren", "settings:grid")],
+                [("\u25c0\ufe0f Einstellungen", "menu:settings")],
+            ])
 
         return "Unbekannte Aktion.", BACK_BUTTON
+
+    # -- Async action handler --
+
+    async def _handle_action(
+        self, data: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Execute an action and return result text + markup."""
+        action_name = data.removeprefix("action:")
+
+        # Try action provider first, then individual callbacks
+        try:
+            result: str | None = None
+            if self._action_provider:
+                method = getattr(
+                    self._action_provider, f"action_{action_name}", None,
+                )
+                if method:
+                    result = await method()
+            if result is None and action_name in self._action_callbacks:
+                result = await self._action_callbacks[action_name]()
+            if result is None:
+                result = "Aktion nicht verfügbar."
+        except Exception:
+            logger.warning("Action %s failed", action_name, exc_info=True)
+            result = f"Fehler bei Aktion: {action_name}"
+
+        return (
+            f"\u26a1 <b>Aktion</b>\n\n{result}",
+            _kb([
+                [("\u25c0\ufe0f Aktionen", "menu:actions")],
+                [("\U0001f3e0 Hauptmenü", "back:main")],
+            ]),
+        )
 
     # -- Formatters --
 
@@ -721,6 +870,17 @@ class TelegramBot:
             "EMERGENCY_SELL": "\u203c\ufe0f",
         }.get(s.pause_state, "\u2753")
 
+        # Blow-through indicator
+        bt_label = (
+            "\U0001f4a8 Blow-Through AN" if s.blow_through_mode
+            else ""
+        )
+
+        price_str = (
+            f"  BTC Preis:    ${s.btc_price_usd:,.0f}\n"
+            if s.btc_price_usd > 0 else ""
+        )
+
         return (
             f"\U0001f4ca <b>Portfolio Status</b>\n"
             f"\n"
@@ -729,18 +889,107 @@ class TelegramBot:
             f"  BTC:          {s.btc_balance:.8f}\n"
             f"  USD:          ${s.usd_balance:,.0f}\n"
             f"  Allokation:   {s.btc_allocation_pct:.1%} BTC\n"
+            f"{price_str}"
             f"\n"
             f"<b>Risk</b>\n"
             f"  {pause_icon} Status: {s.pause_state}\n"
             f"  Drawdown:     {s.drawdown_pct:.1%}\n"
             f"  HWM:          ${s.high_water_mark_usd:,.0f}\n"
+            f"  TWAP Budget:  {s.twap_budget_remaining_pct:.0%}\n"
             f"\n"
             f"<b>Trading</b>\n"
             f"  Regime:       {s.regime}\n"
             f"  Orders:       {s.active_orders}/{s.grid_levels}\n"
+            f"  Spacing:      {s.grid_spacing_bps} bps\n"
             f"  Ticks:        {s.ticks:,}\n"
             f"  Commands:     {s.commands_issued:,}\n"
             f"  Tick-Latenz:  {s.last_tick_ms:.1f}ms\n"
+            + (f"\n{bt_label}\n" if bt_label else "")
+        )
+
+    def _format_dashboard(self) -> str:
+        """Compact at-a-glance dashboard combining key metrics."""
+        s = self._snap()
+
+        pause_icon = {
+            "ACTIVE_TRADING": "\U0001f7e2",
+            "TAX_LOCK_ACTIVE": "\U0001f7e1",
+            "RISK_PAUSE_ACTIVE": "\U0001f534",
+            "DUAL_LOCK": "\U0001f6d1",
+            "EMERGENCY_SELL": "\u203c\ufe0f",
+        }.get(s.pause_state, "\u2753")
+
+        pnl_icon = "\U0001f4b0" if s.profit_today_usd >= 0 else "\U0001f4c9"
+
+        # Tax bar
+        freigrenze = Decimal("1000")
+        tax_pct = float(s.ytd_taxable_gain_eur / freigrenze) if freigrenze else 0
+        tax_bar = _progress_bar(min(tax_pct, 1.0), 10)
+
+        # DD bar (inverted — more DD = more filled = bad)
+        dd_bar = _progress_bar(min(s.drawdown_pct / 0.20, 1.0), 10)
+
+        # TWAP budget bar
+        twap_bar = _progress_bar(s.twap_budget_remaining_pct, 8)
+
+        # Blow-through indicator
+        bt_label = "AN" if s.blow_through_mode else "AUS"
+        bt_icon = "\U0001f4a8" if s.blow_through_mode else "\U0001f512"
+
+        # Price
+        price_str = (
+            f"${s.btc_price_usd:,.0f}" if s.btc_price_usd > 0 else "N/A"
+        )
+
+        uptime_h = s.uptime_sec / 3600 if s.uptime_sec else 0
+
+        return (
+            f"\U0001f3e0 <b>Dashboard</b>\n"
+            f"\n"
+            f"{pause_icon} {s.pause_state}  |  BTC {price_str}\n"
+            f"\n"
+            f"<b>Portfolio</b>  ${s.portfolio_value_usd:,.0f}\n"
+            f"  BTC: {s.btc_balance:.6f}  ({s.btc_allocation_pct:.0%})\n"
+            f"  USD: ${s.usd_balance:,.0f}\n"
+            f"\n"
+            f"<b>Risk</b>   DD: {dd_bar} {s.drawdown_pct:.1%}\n"
+            f"  HWM: ${s.high_water_mark_usd:,.0f}"
+            f"  |  TWAP: {twap_bar}\n"
+            f"\n"
+            f"<b>Tax</b>    FG: {tax_bar}"
+            f" \u20ac{s.ytd_taxable_gain_eur:,.0f}/\u20ac1k\n"
+            f"  Frei: {s.tax_free_btc:.6f}"
+            f"  |  Vault: {s.vault_btc:.6f}\n"
+            f"  {bt_icon} Blow-Through: {bt_label}\n"
+            f"\n"
+            f"<b>Grid</b>   {s.regime}  |"
+            f"  {s.active_orders}/{s.grid_levels} Orders\n"
+            f"  Spacing: {s.grid_spacing_bps}bps"
+            f"  ({'geo' if s.geometric_spacing else 'lin'})\n"
+            f"\n"
+            f"{pnl_icon} <b>Heute</b>:"
+            f" ${s.profit_today_usd:,.2f}  |  {s.fills_today} Fills\n"
+            f"  Uptime: {uptime_h:.1f}h"
+            f"  |  Latenz: {s.last_tick_ms:.0f}ms\n"
+        )
+
+    def _format_actions_menu(self) -> str:
+        """Show current state relevant to available actions."""
+        s = self._snap()
+        pause_text = (
+            "\u23f8\ufe0f Pausiert" if s.is_paused
+            else "\u25b6\ufe0f Aktiv"
+        )
+        bt_text = "AN" if s.blow_through_mode else "AUS"
+
+        return (
+            f"\u26a1 <b>Aktionen</b>\n"
+            f"\n"
+            f"  Trading: {pause_text}\n"
+            f"  Blow-Through: {bt_text}\n"
+            f"  Wash-Sale Lots: {s.wash_sale_active_lots}\n"
+            f"\n"
+            f"W\u00e4hle eine Aktion:"
         )
 
     def _format_ai(self) -> str:
@@ -928,21 +1177,119 @@ class TelegramBot:
             f"  Verbleibend: \u20ac{remaining:,.2f}\n"
         )
 
+    def _format_tax_vault(self) -> str:
+        """Show vault lots, blow-through mode, and wash sale status."""
+        s = self._snap()
+
+        # Vault status
+        vault_pct = (
+            float(s.vault_btc / s.btc_balance * 100)
+            if s.btc_balance > 0 else 0
+        )
+        vault_bar = _progress_bar(vault_pct / 100, 10)
+
+        # Blow-through mode
+        bt_icon = "\U0001f4a8" if s.blow_through_mode else "\U0001f512"
+        bt_status = (
+            "AKTIV — Freigrenze-Gating deaktiviert"
+            if s.blow_through_mode
+            else "INAKTIV — Freigrenze wird beachtet"
+        )
+
+        # Vault lock priority
+        vl_icon = "\u2705" if s.vault_lock_priority else "\u274c"
+
+        # Wash sale
+        ws_icon = (
+            "\u26a0\ufe0f" if s.wash_sale_active_lots > 0
+            else "\u2705"
+        )
+
+        # Sellable ratio
+        sell_bar = _progress_bar(s.sellable_ratio, 10)
+
+        unlock_text = (
+            f"{s.days_until_unlock}d" if s.days_until_unlock is not None
+            else "N/A"
+        )
+
+        return (
+            f"\U0001f3e6 <b>Vault & Blow-Through</b>\n"
+            f"\n"
+            f"<b>Vault Lots (>365 Tage)</b>\n"
+            f"  {vault_bar} {s.vault_btc:.8f} BTC ({vault_pct:.1f}%)\n"
+            f"  {vl_icon} Vault-Priorit\u00e4t: "
+            f"{'AN' if s.vault_lock_priority else 'AUS'}\n"
+            f"\n"
+            f"<b>Blow-Through Modus</b>\n"
+            f"  {bt_icon} {bt_status}\n"
+            f"\n"
+            f"<b>Wash Sale (\u00a742 AO)</b>\n"
+            f"  {ws_icon} Aktive Cooldowns: {s.wash_sale_active_lots}\n"
+            f"\n"
+            f"<b>Verkaufbar</b>\n"
+            f"  {sell_bar} {s.sellable_ratio:.0%}\n"
+            f"  N\u00e4chster Unlock: {unlock_text}\n"
+            f"  TWAP Budget: {s.twap_budget_remaining_pct:.0%}\n"
+        )
+
+    def _format_grid_orders(self) -> str:
+        """Show current grid orders with spacing details."""
+        s = self._snap()
+
+        spacing_type = "Geometrisch" if s.geometric_spacing else "Linear"
+
+        lines = [
+            "\U0001f4ca <b>Grid-Status</b>\n",
+            f"  Regime:   {s.regime}",
+            f"  Spacing:  {s.grid_spacing_bps} bps ({spacing_type})",
+            f"  Orders:   {s.active_orders}/{s.grid_levels}",
+            f"  TWAP:     {s.twap_budget_remaining_pct:.0%} Budget",
+            "",
+        ]
+
+        if s.grid_orders:
+            lines.append("<b>Offene Orders</b>")
+            lines.append("<pre>")
+            lines.append(f"{'Seite':6} {'Preis':>10} {'Menge':>10} {'Status':8}")
+            lines.append("-" * 38)
+            for side, price, qty, state in s.grid_orders:
+                side_icon = "\U0001f7e2" if side == "buy" else "\U0001f534"
+                lines.append(
+                    f"{side_icon} {side:4} {price:>10} {qty:>10} {state:8}",
+                )
+            lines.append("</pre>")
+        else:
+            lines.append("<i>Keine offenen Grid-Orders.</i>")
+
+        return "\n".join(lines)
+
     def _format_settings_info(self) -> str:
         s = self._snap()
         uptime_h = s.uptime_sec / 3600 if s.uptime_sec else 0
 
+        spacing_type = "Geometrisch" if s.geometric_spacing else "Linear"
+        bt_mode = "AN" if s.blow_through_mode else "AUS"
+        vault_prio = "AN" if s.vault_lock_priority else "AUS"
+
         return (
             f"\U0001f50d <b>Bot Info</b>\n"
             f"\n"
-            f"  Uptime:     {uptime_h:.1f}h\n"
-            f"  Ticks:      {s.ticks:,}\n"
-            f"  Commands:   {s.commands_issued:,}\n"
-            f"  Fills:      {s.fills_today}\n"
-            f"  Regime:     {s.regime}\n"
-            f"  Pause:      {s.pause_state}\n"
-            f"  EUR/USD:    {s.eur_usd_rate}\n"
-            f"  AI:         {s.ai_provider or 'disabled'}\n"
+            f"<b>System</b>\n"
+            f"  Uptime:       {uptime_h:.1f}h\n"
+            f"  Ticks:        {s.ticks:,}\n"
+            f"  Commands:     {s.commands_issued:,}\n"
+            f"  Fills heute:  {s.fills_today}\n"
+            f"  Tick-Latenz:  {s.last_tick_ms:.1f}ms\n"
+            f"\n"
+            f"<b>Konfiguration</b>\n"
+            f"  Regime:       {s.regime}\n"
+            f"  Pause:        {s.pause_state}\n"
+            f"  Grid:         {spacing_type}, {s.grid_spacing_bps} bps\n"
+            f"  Blow-Through: {bt_mode}\n"
+            f"  Vault-Prio:   {vault_prio}\n"
+            f"  EUR/USD:      {s.eur_usd_rate}\n"
+            f"  AI:           {s.ai_provider or 'deaktiviert'}\n"
         )
 
 

@@ -485,7 +485,42 @@ class StrategyLoop:
             fills_today=self.fills_today,
             profit_today_usd=self.profit_today_usd,
             eur_usd_rate=self._eur_usd_rate,
+            # Blow-through overhaul fields
+            blow_through_mode=self._tax._blow_through_mode,
+            vault_btc=self._tax.vault_lot_btc(),
+            vault_lock_priority=self._tax._vault_lock_priority,
+            geometric_spacing=getattr(self._grid, "_geometric", True),
+            grid_spacing_bps=self._grid.spacing_bps,
+            btc_price_usd=self._inv.btc_price,
+            twap_budget_remaining_pct=self._twap_budget_pct(),
+            wash_sale_active_lots=len(self._tax._harvest_timestamps),
+            grid_orders=self._grid_order_tuples(),
+            is_paused=self._risk.pause_state.name != "ACTIVE_TRADING",
         )
+
+    def _twap_budget_pct(self) -> float:
+        """Return TWAP budget remaining as a fraction 0..1."""
+        total_usd = self._inv.portfolio_value_usd
+        if total_usd <= 0:
+            return 1.0
+        remaining = self._inv._twap_remaining_usd(total_usd)
+        budget = total_usd * Decimal(str(self._inv._max_rebalance_pct_per_min))
+        if budget <= 0:
+            return 1.0
+        return float(min(remaining / budget, Decimal("1")))
+
+    def _grid_order_tuples(self) -> list[tuple[str, str, str, str]]:
+        """Return grid orders as (side, price, qty, state) string tuples."""
+        orders = []
+        for slot in self._om.slots:
+            if hasattr(slot, "state") and slot.state.name != "EMPTY":
+                orders.append((
+                    slot.side.value,
+                    f"${slot.price:,.1f}" if slot.price else "—",
+                    f"{slot.qty:.6f}" if slot.qty else "—",
+                    slot.state.name.lower(),
+                ))
+        return orders
 
     def _record_tick_metrics(self) -> None:
         """Push tick metrics to the metrics registry."""
