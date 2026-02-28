@@ -185,9 +185,10 @@ class StrategyLoop:
             target_pct=limits.target_pct,
         )
 
-        # 8. Compute grid levels with skewed spacings
+        # 8. Compute grid levels with skewed spacings and regime-scaled sizing
         base_spacing = self._grid.optimal_spacing_bps()
         buy_spacing, sell_spacing = self._skew.apply_to_spacing(base_spacing, skew_result)
+        size_scale = Decimal(str(regime_decision.order_size_scale))
 
         self._grid.compute_grid(
             mid_price=mid_price,
@@ -196,6 +197,8 @@ class StrategyLoop:
             spacing_bps=base_spacing,
             buy_spacing_bps=buy_spacing,
             sell_spacing_bps=sell_spacing,
+            buy_qty_scale=size_scale,
+            sell_qty_scale=size_scale,
         )
 
         # Deactivate sell levels if tax-locked

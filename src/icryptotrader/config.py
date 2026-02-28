@@ -58,6 +58,7 @@ class RegimeAllocation:
     btc_min_pct: float = 0.40
     grid_levels: int = 5
     signal_enabled: bool = True
+    order_size_scale: float = 1.0  # Multiplier for order_size_usd per regime
 
 
 @dataclass
@@ -65,25 +66,25 @@ class RegimeConfig:
     range_bound: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.50, btc_max_pct=0.60, btc_min_pct=0.40,
-            grid_levels=5, signal_enabled=True,
+            grid_levels=5, signal_enabled=True, order_size_scale=1.0,
         )
     )
     trending_up: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.70, btc_max_pct=0.80, btc_min_pct=0.55,
-            grid_levels=3, signal_enabled=True,
+            grid_levels=3, signal_enabled=True, order_size_scale=0.75,
         )
     )
     trending_down: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.30, btc_max_pct=0.40, btc_min_pct=0.15,
-            grid_levels=3, signal_enabled=True,
+            grid_levels=3, signal_enabled=True, order_size_scale=0.75,
         )
     )
     chaos: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.00, btc_max_pct=0.05, btc_min_pct=0.00,
-            grid_levels=0, signal_enabled=False,
+            grid_levels=0, signal_enabled=False, order_size_scale=0.5,
         )
     )
 

@@ -48,6 +48,7 @@ class RegimeDecision:
     reason: str
     grid_levels_buy: int
     grid_levels_sell: int
+    order_size_scale: float = 1.0  # Multiplier for order_size_usd
 
 
 class RegimeRouter:
@@ -154,14 +155,14 @@ class RegimeRouter:
             return self._set_regime(
                 Regime.CHAOS, signals, 0.9,
                 f"Extreme volatility ({vol:.3f})",
-                grid_buy=0, grid_sell=0,
+                grid_buy=0, grid_sell=0, size_scale=0.5,
             )
 
         if vol >= self._high_vol and self._toxicity >= self._toxicity_threshold:
             return self._set_regime(
                 Regime.CHAOS, signals, 0.8,
                 f"High vol ({vol:.3f}) + toxic flow ({self._toxicity:.2f})",
-                grid_buy=0, grid_sell=0,
+                grid_buy=0, grid_sell=0, size_scale=0.5,
             )
 
         # 2. Trending: significant momentum
@@ -171,6 +172,7 @@ class RegimeRouter:
                 Regime.TRENDING_UP, signals, confidence,
                 f"Upward momentum ({momentum:.3f})",
                 grid_buy=self._default_buy, grid_sell=max(1, self._default_sell - 2),
+                size_scale=0.75,
             )
 
         if momentum < -self._momentum_threshold:
@@ -179,6 +181,7 @@ class RegimeRouter:
                 Regime.TRENDING_DOWN, signals, confidence,
                 f"Downward momentum ({momentum:.3f})",
                 grid_buy=max(1, self._default_buy - 2), grid_sell=self._default_sell,
+                size_scale=0.75,
             )
 
         # 3. Range-bound: default
@@ -186,6 +189,7 @@ class RegimeRouter:
             Regime.RANGE_BOUND, signals, 0.6,
             "Low volatility, no strong trend",
             grid_buy=self._default_buy, grid_sell=self._default_sell,
+            size_scale=1.0,
         )
 
     def override_regime(self, regime: Regime, reason: str = "manual") -> None:
@@ -215,6 +219,7 @@ class RegimeRouter:
         reason: str,
         grid_buy: int,
         grid_sell: int,
+        size_scale: float = 1.0,
     ) -> RegimeDecision:
         if regime != self._regime:
             old = self._regime
@@ -230,4 +235,5 @@ class RegimeRouter:
             reason=reason,
             grid_levels_buy=grid_buy,
             grid_levels_sell=grid_sell,
+            order_size_scale=size_scale,
         )
