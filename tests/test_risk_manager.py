@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import patch
 
 from icryptotrader.risk.risk_manager import DrawdownLevel, RiskManager
 from icryptotrader.types import PauseState, Regime
@@ -320,3 +321,94 @@ class TestTrailingDrawdownStop:
         assert rm.check_price_velocity(Decimal("81500")) is True
         # After cooldown, check hysteresis — still volatile
         # The unfreeze check looks at current velocity vs 50% threshold
+
+    def test_velocity_hysteresis_unfreezes_after_stabilization(self) -> None:
+        """Circuit breaker should unfreeze once price stabilizes and old entries age out.
+
+        Regression test: previously, the price deque was not updated during
+        freeze, so pre-crash prices never aged out, causing an infinite
+        freeze extension loop.
+        """
+        t = 0.0
+
+        def mock_monotonic() -> float:
+            return t
+
+        with patch("icryptotrader.risk.risk_manager.time.monotonic", side_effect=lambda: t):
+            rm = RiskManager(
+                price_velocity_freeze_pct=0.03,
+                price_velocity_window_sec=60,
+                price_velocity_cooldown_sec=30,
+            )
+            # t=0: initial price
+            t = 0.0
+            rm.check_price_velocity(Decimal("85000"))
+
+            # t=1: 4% crash → freeze triggered
+            t = 1.0
+            assert rm.check_price_velocity(Decimal("81500")) is True
+            assert rm._velocity_frozen is True
+
+            # t=15: still in cooldown (unfreeze at t=31), price stabilized
+            t = 15.0
+            assert rm.check_price_velocity(Decimal("81500")) is True
+
+            # t=32: cooldown expired, but pre-crash price (t=0) still in 60s window
+            # Hysteresis check will see old price, but NEW prices were also recorded
+            # during freeze so the deque now has post-crash entries too
+            t = 32.0
+            # Still frozen because t=0 entry (85000) is within the 60s window
+            # and velocity from oldest (85000) to current (81500) > 1.5%
+            result = rm.check_price_velocity(Decimal("81500"))
+            # May extend if the oldest entry hasn't aged out yet
+            assert result is True  # Expected: pre-crash entry still in window
+
+            # t=62: cooldown expired (extended to t=62 at t=32), AND the
+            # pre-crash entry (t=0, 85000) has aged out of the 60s window
+            # (cutoff=62-60=2). The deque now only contains post-crash
+            # entries at 81500. Velocity ≈ 0% < 1.5% → unfreezes!
+            t = 62.0
+            result = rm.check_price_velocity(Decimal("81500"))
+            assert result is False  # Pre-crash price aged out, stabilized → unfreeze
+            assert rm._velocity_frozen is False
+
+
+class TestRecordDeposit:
+    def test_deposit_adjusts_initial_and_hwm(self) -> None:
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("5000"),
+            trailing_stop_enabled=True,
+            trailing_stop_tighten_pct=0.02,
+        )
+        rm.record_deposit(Decimal("5000"))
+        # Initial should now be 10000
+        assert rm._initial_portfolio == Decimal("10000")
+        # HWM should be bumped too
+        assert rm._hwm == Decimal("10000")
+
+    def test_deposit_prevents_false_tightening(self) -> None:
+        """After a deposit, trailing stop should NOT tighten from deposit-induced growth."""
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("5000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=True,
+            trailing_stop_tighten_pct=0.02,
+        )
+        # Deposit $5k → total baseline $10k
+        rm.record_deposit(Decimal("5000"))
+        # Portfolio at $10k (no real growth, just deposit)
+        rm.update_portfolio(Decimal("5000"), Decimal("5000"))
+        # Thresholds should NOT have tightened
+        assert rm.effective_max_dd_pct == 0.15
+        assert rm.effective_emergency_dd_pct == 0.20
+
+    def test_deposit_zero_ignored(self) -> None:
+        rm = RiskManager(initial_portfolio_usd=Decimal("5000"))
+        rm.record_deposit(Decimal("0"))
+        assert rm._initial_portfolio == Decimal("5000")
+
+    def test_deposit_negative_ignored(self) -> None:
+        rm = RiskManager(initial_portfolio_usd=Decimal("5000"))
+        rm.record_deposit(Decimal("-100"))
+        assert rm._initial_portfolio == Decimal("5000")

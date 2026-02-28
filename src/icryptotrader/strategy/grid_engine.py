@@ -74,6 +74,7 @@ class GridEngine:
         adverse_selection_bps: Decimal = Decimal("10"),
         min_edge_bps: Decimal = Decimal("5"),
         geometric: bool = True,
+        price_tick_size: Decimal = Decimal("0.1"),
     ) -> None:
         self._fee_model = fee_model
         self._order_size_usd = order_size_usd
@@ -81,6 +82,7 @@ class GridEngine:
         self._adverse_selection_bps = adverse_selection_bps
         self._min_edge_bps = min_edge_bps
         self._geometric = geometric
+        self._price_tick = price_tick_size
 
         self._state: GridState = GridState()
 
@@ -154,12 +156,12 @@ class GridEngine:
         for i in range(num_buy_levels):
             if self._geometric:
                 price = (mid_price * (one - buy_factor) ** (i + 1)).quantize(
-                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                    self._price_tick, rounding=ROUND_HALF_UP,
                 )
             else:
                 offset = (i + 1) * buy_factor
                 price = (mid_price * (one - offset)).quantize(
-                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                    self._price_tick, rounding=ROUND_HALF_UP,
                 )
             if price <= 0:
                 break
@@ -172,12 +174,12 @@ class GridEngine:
         for i in range(num_sell_levels):
             if self._geometric:
                 price = (mid_price * (one + sell_factor) ** (i + 1)).quantize(
-                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                    self._price_tick, rounding=ROUND_HALF_UP,
                 )
             else:
                 offset = (i + 1) * sell_factor
                 price = (mid_price * (one + offset)).quantize(
-                    Decimal("0.1"), rounding=ROUND_HALF_UP,
+                    self._price_tick, rounding=ROUND_HALF_UP,
                 )
             qty = self._qty_for_price(price, sell_qty_scale)
             if qty >= MIN_ORDER_BTC:
