@@ -153,11 +153,41 @@ class MetricsConfig:
 
 
 @dataclass
+class HedgeConfig:
+    """Configuration for the hedge manager."""
+
+    enabled: bool = False
+    trigger_drawdown_pct: float = 0.10
+    strategy: str = "reduce_exposure"  # "reduce_exposure" or "inverse_grid"
+    max_reduction_pct: float = 0.50  # Max portion of buys to cancel
+
+
+@dataclass
+class WebConfig:
+    """Configuration for the web dashboard."""
+
+    enabled: bool = False
+    port: int = 8080
+    host: str = "127.0.0.1"
+    username: str = ""
+    password: str = ""
+
+
+@dataclass
+class PairAllocation:
+    """Allocation weight for a single trading pair."""
+
+    symbol: str = "XBT/USD"
+    weight: float = 1.0
+
+
+@dataclass
 class Config:
     pair: str = "XBT/USD"
     log_level: str = "INFO"
     data_dir: str = "data"
     ledger_path: str = "data/fifo_ledger.json"
+    persistence_backend: str = "json"  # "json" or "sqlite"
     kraken: KrakenConfig = field(default_factory=KrakenConfig)
     grid: GridConfig = field(default_factory=GridConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -169,6 +199,9 @@ class Config:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     ai_signal: AISignalConfig = field(default_factory=AISignalConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
+    hedge: HedgeConfig = field(default_factory=HedgeConfig)
+    web: WebConfig = field(default_factory=WebConfig)
+    pairs: list[PairAllocation] = field(default_factory=list)
 
 
 def _apply_toml_section(obj: object, data: dict) -> None:  # type: ignore[type-arg]
@@ -178,7 +211,13 @@ def _apply_toml_section(obj: object, data: dict) -> None:  # type: ignore[type-a
             logger.warning("Unknown config key: %s", key)
             continue
         current = getattr(obj, key)
-        if isinstance(value, dict) and hasattr(current, "__dataclass_fields__"):
+        # Handle list of PairAllocation from TOML [[pairs]]
+        if key == "pairs" and isinstance(value, list):
+            setattr(obj, key, [
+                PairAllocation(**item) if isinstance(item, dict) else item
+                for item in value
+            ])
+        elif isinstance(value, dict) and hasattr(current, "__dataclass_fields__"):
             _apply_toml_section(current, value)
         elif isinstance(current, Decimal):
             setattr(obj, key, Decimal(str(value)))
@@ -260,6 +299,17 @@ def validate_config(cfg: Config) -> list[str]:
             errors.append("ai_signal.provider must be 'gemini', 'anthropic', or 'openai'")
         if not (0.0 <= cfg.ai_signal.weight <= 1.0):
             errors.append("ai_signal.weight must be in [0.0, 1.0]")
+
+    # Persistence
+    if cfg.persistence_backend not in ("json", "sqlite"):
+        errors.append("persistence_backend must be 'json' or 'sqlite'")
+
+    # Hedge
+    if cfg.hedge.enabled:
+        if not (0 < cfg.hedge.trigger_drawdown_pct <= 1.0):
+            errors.append("hedge.trigger_drawdown_pct must be in (0, 1.0]")
+        if cfg.hedge.strategy not in ("reduce_exposure", "inverse_grid"):
+            errors.append("hedge.strategy must be 'reduce_exposure' or 'inverse_grid'")
 
     return errors
 

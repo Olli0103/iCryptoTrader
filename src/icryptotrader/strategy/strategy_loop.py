@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
     from icryptotrader.metrics import MetricsRegistry
     from icryptotrader.notify.telegram import BotSnapshot
+    from icryptotrader.strategy.ai_signal import AISignalEngine
+    from icryptotrader.strategy.bollinger import BollingerSpacing
 
 from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
@@ -93,6 +96,9 @@ class StrategyLoop:
         compound_base_usd: Decimal = Decimal("5000"),
         base_order_size_usd: Decimal = Decimal("500"),
         metrics: MetricsRegistry | None = None,
+        bollinger: BollingerSpacing | None = None,
+        ai_signal: AISignalEngine | None = None,
+        persistence_backend: str = "json",
     ) -> None:
         self._fee = fee_model
         self._om = order_manager
@@ -107,10 +113,22 @@ class StrategyLoop:
         self._ledger_path = ledger_path
         self._metrics = metrics
 
+        # Bollinger + ATR dynamic spacing
+        self._bollinger = bollinger
+
+        # AI signal engine (reads cached last_signal)
+        self._ai_signal = ai_signal
+
+        # Persistence backend
+        self._persistence_backend = persistence_backend
+
         # Auto-compounding
         self._auto_compound = auto_compound
         self._compound_base_usd = compound_base_usd
         self._base_order_size_usd = base_order_size_usd
+
+        # High/low tracker for Bollinger ATR feed
+        self._price_window: deque[Decimal] = deque(maxlen=50)
 
         # Metrics
         self.ticks: int = 0
@@ -128,12 +146,22 @@ class StrategyLoop:
 
     def load_ledger(self) -> None:
         """Load FIFO ledger from disk at startup."""
-        if self._ledger_path:
+        if not self._ledger_path:
+            return
+        if self._persistence_backend == "sqlite":
+            db_path = self._ledger_path.with_suffix(".db")
+            self._ledger.load_sqlite(db_path)
+        else:
             self._ledger.load(self._ledger_path)
 
     def save_ledger(self) -> None:
         """Save FIFO ledger to disk (called automatically after fills)."""
-        if self._ledger_path:
+        if not self._ledger_path:
+            return
+        if self._persistence_backend == "sqlite":
+            db_path = self._ledger_path.with_suffix(".db")
+            self._ledger.save_sqlite(db_path)
+        else:
             self._ledger.save(self._ledger_path)
 
     def compound_order_size(self) -> Decimal:
@@ -226,10 +254,32 @@ class StrategyLoop:
         )
 
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
+        # Use Bollinger+ATR dynamic spacing if available, else fee-model static
         base_spacing = self._grid.optimal_spacing_bps()
+        if self._bollinger is not None:
+            self._price_window.append(mid_price)
+            high = max(self._price_window)
+            low = min(self._price_window)
+            bb_state = self._bollinger.update(mid_price, high=high, low=low)
+            if bb_state is not None:
+                base_spacing = bb_state.suggested_spacing_bps
+
+        # Apply AI signal bias to spacing
+        ai_bias_bps = Decimal("0")
+        if self._ai_signal is not None:
+            sig = self._ai_signal.last_signal
+            if sig.confidence > 0 and sig.suggested_bias_bps != 0:
+                ai_bias_bps = sig.suggested_bias_bps * Decimal(
+                    str(sig.confidence * self._ai_signal.weight),
+                )
+
         buy_spacing, sell_spacing = self._skew.apply_to_spacing(
             base_spacing, skew_result,
         )
+        # AI bias: positive = bullish → tighter buys, wider sells
+        if ai_bias_bps != 0:
+            buy_spacing = max(Decimal("5"), buy_spacing - ai_bias_bps)
+            sell_spacing = max(Decimal("5"), sell_spacing + ai_bias_bps)
 
         # Auto-compound: scale order size with portfolio growth
         size_scale = Decimal(str(regime_decision.order_size_scale))
@@ -358,6 +408,25 @@ class StrategyLoop:
         # Persist ledger to disk after every fill
         self.save_ledger()
 
+    def build_ai_context(self) -> dict[str, Any]:
+        """Build market context dict for the AI signal engine."""
+        snap = self._inv.snapshot()
+        regime_decision = self._regime.classify()
+        return {
+            "mid_price": snap.btc_price_usd,
+            "spread_bps": self._grid.spacing_bps,
+            "volatility_pct": self._regime._ewma_vol
+            if hasattr(self._regime, "_ewma_vol")
+            else 0.0,
+            "regime": regime_decision.regime.value,
+            "btc_allocation_pct": snap.btc_allocation_pct * 100,
+            "drawdown_pct": self._risk.drawdown_pct * 100,
+            "price_change_1h_pct": 0.0,
+            "price_change_24h_pct": 0.0,
+            "book_imbalance": 0.0,
+            "ytd_taxable_gain_eur": float(self._ledger.taxable_gain_ytd()),
+        }
+
     def bot_snapshot(self) -> BotSnapshot:
         """Provide a snapshot for the Telegram bot (BotDataProvider).
 
@@ -395,6 +464,24 @@ class StrategyLoop:
             sellable_ratio=self._ledger.sellable_ratio(),
             days_until_unlock=self._ledger.days_until_next_free(),
             open_lots=len(self._ledger.open_lots()),
+            ai_direction=self._ai_signal.last_signal.direction.name
+            if self._ai_signal
+            else "NEUTRAL",
+            ai_confidence=self._ai_signal.last_signal.confidence
+            if self._ai_signal
+            else 0.0,
+            ai_last_latency_ms=self._ai_signal.last_signal.latency_ms
+            if self._ai_signal
+            else 0.0,
+            ai_provider=self._ai_signal._provider
+            if self._ai_signal
+            else "",
+            ai_call_count=self._ai_signal._call_count
+            if self._ai_signal
+            else 0,
+            ai_error_count=self._ai_signal._error_count
+            if self._ai_signal
+            else 0,
             fills_today=self.fills_today,
             profit_today_usd=self.profit_today_usd,
             eur_usd_rate=self._eur_usd_rate,
