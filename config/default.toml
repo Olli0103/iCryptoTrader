@@ -68,6 +68,14 @@ max_counter = 180
 decay_rate = 3.75
 headroom_pct = 0.80
 
+[bollinger]
+enabled = true
+window = 20
+multiplier = 2.0
+spacing_scale = 0.5
+min_spacing_bps = "15"
+max_spacing_bps = "200"
+
 [telegram]
 enabled = false
 bot_token = ""

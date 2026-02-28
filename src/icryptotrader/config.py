@@ -100,6 +100,16 @@ class RateLimitConfig:
 
 
 @dataclass
+class BollingerConfig:
+    enabled: bool = True
+    window: int = 20
+    multiplier: float = 2.0
+    spacing_scale: float = 0.5
+    min_spacing_bps: Decimal = Decimal("15")
+    max_spacing_bps: Decimal = Decimal("200")
+
+
+@dataclass
 class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
@@ -119,6 +129,7 @@ class Config:
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     ws: WSConfig = field(default_factory=WSConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    bollinger: BollingerConfig = field(default_factory=BollingerConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
 
 
