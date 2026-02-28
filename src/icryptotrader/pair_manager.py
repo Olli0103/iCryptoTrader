@@ -126,7 +126,7 @@ class PairManager:
         if not self._pairs:
             return PortfolioRisk()
 
-        total = sum(p.current_value_usd for p in self._pairs.values())
+        total = sum((p.current_value_usd for p in self._pairs.values()), Decimal("0"))
         if total > self._high_water_mark:
             self._high_water_mark = total
 
@@ -193,4 +193,4 @@ def _pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
     denom = (var_x * var_y) ** 0.5
     if denom == 0:
         return 0.0
-    return cov / denom
+    return float(cov / denom)

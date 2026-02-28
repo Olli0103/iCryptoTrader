@@ -253,14 +253,16 @@ class FIFOLedger:
 
     def total_btc(self) -> Decimal:
         return sum(
-            lot.remaining_qty_btc for lot in self._lots if lot.status != LotStatus.CLOSED
+            (lot.remaining_qty_btc for lot in self._lots if lot.status != LotStatus.CLOSED),
+            Decimal("0"),
         )
 
     def tax_free_btc(self) -> Decimal:
         return sum(
-            lot.remaining_qty_btc
+            (lot.remaining_qty_btc
             for lot in self._lots
-            if lot.status != LotStatus.CLOSED and lot.is_tax_free
+            if lot.status != LotStatus.CLOSED and lot.is_tax_free),
+            Decimal("0"),
         )
 
     def locked_btc(self) -> Decimal:
@@ -288,10 +290,11 @@ class FIFOLedger:
     def near_threshold_btc(self, near_days: int = 330) -> Decimal:
         """BTC held between near_days and 365 days (approaching tax-free)."""
         return sum(
-            lot.remaining_qty_btc
+            (lot.remaining_qty_btc
             for lot in self._lots
             if lot.status != LotStatus.CLOSED
-            and near_days <= lot.days_held < HOLDING_PERIOD_DAYS
+            and near_days <= lot.days_held < HOLDING_PERIOD_DAYS),
+            Decimal("0"),
         )
 
     def open_lots(self) -> list[TaxLot]:
@@ -343,9 +346,10 @@ class FIFOLedger:
         """Sum of taxable gains/losses for the given year (default: current year)."""
         yr = year or date.today().year
         return sum(
-            d.gain_loss_eur
+            (d.gain_loss_eur
             for d in self.all_disposals(yr)
-            if d.is_taxable
+            if d.is_taxable),
+            Decimal("0"),
         )
 
     # --- Persistence ---

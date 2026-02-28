@@ -137,6 +137,34 @@ levels = -5
         assert cfg.ai_signal.provider == "gemini"
         assert cfg.ai_signal.weight == 0.3
 
+    def test_invalid_persistence_backend(self) -> None:
+        cfg = Config()
+        cfg.persistence_backend = "postgresql"
+        errors = validate_config(cfg)
+        assert any("persistence_backend" in e for e in errors)
+
+    def test_invalid_hedge_strategy(self) -> None:
+        cfg = Config()
+        cfg.hedge.enabled = True
+        cfg.hedge.strategy = "invalid"
+        errors = validate_config(cfg)
+        assert any("hedge.strategy" in e for e in errors)
+
+    def test_hedge_config_defaults(self) -> None:
+        cfg = Config()
+        assert cfg.hedge.enabled is False
+        assert cfg.hedge.trigger_drawdown_pct == 0.10
+        assert cfg.hedge.strategy == "reduce_exposure"
+
+    def test_web_config_defaults(self) -> None:
+        cfg = Config()
+        assert cfg.web.enabled is False
+        assert cfg.web.port == 8080
+
+    def test_persistence_backend_default(self) -> None:
+        cfg = Config()
+        assert cfg.persistence_backend == "json"
+
     def test_metrics_config_defaults(self) -> None:
         cfg = Config()
         assert cfg.metrics.enabled is False

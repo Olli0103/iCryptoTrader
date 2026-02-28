@@ -225,3 +225,130 @@ class TestBotSnapshot:
         snap = loop.bot_snapshot()
         assert snap.ai_direction == "NEUTRAL"
         assert snap.ai_confidence == 0.0
+
+
+class TestBollingerWarmup:
+    """Test behavior during Bollinger warmup period (window not yet full)."""
+
+    def test_warmup_uses_fee_model_spacing(self) -> None:
+        """Before Bollinger window fills, spacing should fall back to fee model."""
+        bb = BollingerSpacing(window=20)
+        loop = _make_loop(bollinger=bb)
+        # Only 3 ticks — well below window=20
+        for _ in range(3):
+            commands = loop.tick(mid_price=Decimal("85000"))
+            assert isinstance(commands, list)
+        # Bollinger should NOT be active yet
+        assert bb.state is None
+        # But ticks should still produce valid output
+        assert loop.ticks == 3
+
+    def test_warmup_completes(self) -> None:
+        """After enough ticks, Bollinger should activate and influence spacing."""
+        bb = BollingerSpacing(window=5)
+        loop = _make_loop(bollinger=bb)
+        # First 4 ticks: warmup
+        for i in range(4):
+            loop.tick(mid_price=Decimal("85000") + Decimal(str(i * 50)))
+            assert bb.state is None
+        # 5th tick: window full
+        loop.tick(mid_price=Decimal("85300"))
+        assert bb.state is not None
+
+
+class TestAISignalEdgeCases:
+    """Test AI signal edge cases that affect spacing."""
+
+    def test_zero_confidence_does_not_affect_spacing(self) -> None:
+        """AI signal with confidence=0 should not modify buy/sell spacing."""
+        from icryptotrader.strategy.ai_signal import AISignal, SignalDirection
+
+        mock_signal = AISignal(
+            direction=SignalDirection.STRONG_BUY,
+            confidence=0.0,  # Zero confidence — should be ignored
+            reasoning="",
+            suggested_bias_bps=Decimal("50"),  # Would be huge bias if applied
+            regime_hint="range_bound",
+            provider="test",
+            model="test",
+            latency_ms=0.0,
+            timestamp=0.0,
+            error="",
+        )
+
+        ai = MagicMock()
+        ai.last_signal = mock_signal
+        ai.weight = 1.0
+
+        loop_with_ai = _make_loop(ai_signal=ai)
+        loop_without_ai = _make_loop(ai_signal=None)
+
+        commands_with = loop_with_ai.tick(mid_price=Decimal("85000"))
+        commands_without = loop_without_ai.tick(mid_price=Decimal("85000"))
+
+        # Both should produce the same number of commands
+        # (zero-confidence AI should be a no-op)
+        assert len(commands_with) == len(commands_without)
+
+
+class TestRiskPauseIntegration:
+    """Test that risk pauses affect tick behavior."""
+
+    def test_circuit_breaker_freezes_on_crash(self) -> None:
+        """Large price move triggers circuit breaker freeze, skipping tick."""
+        loop = _make_loop(usd=Decimal("500"), btc=Decimal("0.05"))
+        # Establish baseline at normal price
+        loop.tick(mid_price=Decimal("85000"))
+
+        # 50% crash triggers circuit breaker (>3% velocity)
+        loop.tick(mid_price=Decimal("42000"))
+
+        # Circuit breaker should have frozen
+        assert loop._risk._velocity_frozen is True
+        # Next tick should be skipped due to velocity freeze
+        loop.tick(mid_price=Decimal("42000"))
+        assert loop.ticks_skipped_velocity >= 1
+
+    def test_is_trading_allowed_check(self) -> None:
+        """Verify is_trading_allowed returns False for risk/emergency states."""
+        from icryptotrader.types import PauseState
+
+        loop = _make_loop()
+        rm = loop._risk
+
+        # Active trading is allowed
+        rm._pause_state = PauseState.ACTIVE_TRADING
+        assert rm.is_trading_allowed is True
+
+        # Risk pause is NOT allowed
+        rm._pause_state = PauseState.RISK_PAUSE_ACTIVE
+        assert rm.is_trading_allowed is False
+
+        # Emergency sell is NOT allowed
+        rm._pause_state = PauseState.EMERGENCY_SELL
+        assert rm.is_trading_allowed is False
+
+        # Dual lock is NOT allowed
+        rm._pause_state = PauseState.DUAL_LOCK
+        assert rm.is_trading_allowed is False
+
+
+class TestInvalidPersistenceBackend:
+    """Test behavior with invalid persistence backend."""
+
+    def test_invalid_backend_defaults_to_json(self, tmp_path: Path) -> None:
+        """Invalid persistence_backend should fall back to JSON behavior."""
+        ledger_path = tmp_path / "ledger.json"
+        loop = _make_loop(persistence_backend="invalid")
+        loop._ledger_path = ledger_path
+
+        loop._ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("1"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+
+        loop.save_ledger()
+        # Should default to JSON
+        assert ledger_path.exists()

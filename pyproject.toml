@@ -49,3 +49,13 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = [
+    "orjson",
+    "httpx",
+    "httpx.*",
+    "websockets",
+    "websockets.*",
+]
+ignore_missing_imports = true

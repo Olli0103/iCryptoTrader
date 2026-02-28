@@ -21,7 +21,7 @@ class JSONFormatter(logging.Formatter):
         }
         if record.exc_info and record.exc_info[1]:
             entry["exc"] = self.formatException(record.exc_info)
-        return orjson.dumps(entry).decode()
+        return str(orjson.dumps(entry).decode())
 
 
 def setup_logging(level: str = "INFO", json_output: bool = False) -> None:

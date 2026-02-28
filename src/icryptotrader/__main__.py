@@ -161,9 +161,32 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         metrics_registry = MetricsRegistry(prefix=cfg.metrics.prefix)
         metrics_server = MetricsServer(registry=metrics_registry, port=cfg.metrics.port)
 
+    # Hedge manager (optional)
+    hedge_manager = None
+    if cfg.hedge.enabled:
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        hedge_manager = HedgeManager(
+            trigger_drawdown_pct=cfg.hedge.trigger_drawdown_pct,
+            strategy=cfg.hedge.strategy,
+            max_reduction_pct=cfg.hedge.max_reduction_pct,
+        )
+
+    # Web dashboard (optional)
+    web_dashboard = None
+    if cfg.web.enabled:
+        from icryptotrader.web.dashboard import WebDashboard
+
+        web_dashboard = WebDashboard(
+            host=cfg.web.host,
+            port=cfg.web.port,
+            username=cfg.web.username,
+            password=cfg.web.password,
+        )
+
     # Persistence path
     ledger_path = Path(cfg.ledger_path)
-    persistence_backend = getattr(cfg, "persistence_backend", "json")
+    persistence_backend = cfg.persistence_backend
 
     # Strategy loop
     strategy_loop = StrategyLoop(
@@ -226,6 +249,8 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         "inventory": inventory,
         "risk_manager": risk_manager,
         "ledger": ledger,
+        "hedge_manager": hedge_manager,
+        "web_dashboard": web_dashboard,
     }
 
 
@@ -248,6 +273,8 @@ async def _run_bot(cfg: Config) -> None:
     metrics_server = c["metrics_server"]
     telegram_bot = c["telegram_bot"]
     ai_signal = c["ai_signal"]
+    hedge_manager = c["hedge_manager"]
+    web_dashboard = c["web_dashboard"]
 
     # Lifecycle manager
     lm = LifecycleManager(
@@ -268,6 +295,11 @@ async def _run_bot(cfg: Config) -> None:
     if telegram_bot:
         await telegram_bot.start()
         logger.info("Telegram bot started")
+
+    if web_dashboard:
+        web_dashboard.set_loop(strategy_loop)
+        await web_dashboard.start()
+        logger.info("Web dashboard started on %s:%d", cfg.web.host, cfg.web.port)
 
     # Watchdog
     watchdog = Watchdog(
@@ -298,6 +330,24 @@ async def _run_bot(cfg: Config) -> None:
             try:
                 price = c["inventory"].btc_price
                 if price > 0:
+                    # Evaluate hedge before tick
+                    if hedge_manager:
+                        risk_mgr = c["risk_manager"]
+                        regime_decision = strategy_loop._regime.classify()
+                        inv_snap = c["inventory"].snapshot()
+                        hedge_action = hedge_manager.evaluate(
+                            drawdown_pct=risk_mgr.drawdown_pct,
+                            regime=regime_decision.regime,
+                            pause_state=risk_mgr.pause_state,
+                            btc_allocation_pct=inv_snap.btc_allocation_pct,
+                            target_allocation_pct=0.5,
+                        )
+                        if hedge_action.active and hedge_action.buy_level_cap is not None:
+                            strategy_loop._grid._levels = min(
+                                strategy_loop._grid._levels,
+                                hedge_action.buy_level_cap,
+                            )
+
                     commands = strategy_loop.tick(mid_price=price)
                     for cmd in commands:
                         params = cmd.get("params", {})
@@ -321,6 +371,8 @@ async def _run_bot(cfg: Config) -> None:
 
     if ai_task:
         ai_task.cancel()
+    if web_dashboard:
+        await web_dashboard.stop()
     if telegram_bot:
         await telegram_bot.stop()
     if metrics_server:

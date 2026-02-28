@@ -57,7 +57,7 @@ class WebDashboard:
 
     def __init__(
         self,
-        strategy_loop: StrategyLoop,
+        strategy_loop: StrategyLoop | None = None,
         risk_manager: RiskManager | None = None,
         metrics_registry: MetricsRegistry | None = None,
         host: str = "127.0.0.1",
@@ -73,6 +73,10 @@ class WebDashboard:
         self._username = username
         self._password = password
         self._server: asyncio.Server | None = None
+
+    def set_loop(self, strategy_loop: StrategyLoop) -> None:
+        """Set the strategy loop reference (for deferred construction)."""
+        self._loop = strategy_loop
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
@@ -123,11 +127,19 @@ class WebDashboard:
             if path == "/" and method == "GET":
                 self._send(writer, 200, _DASHBOARD_HTML, content_type="text/html")
             elif path == "/api/status" and method == "GET":
-                snap = self._loop.bot_snapshot()
-                body = json.dumps(snap.__dict__, cls=_DecimalEncoder, indent=2)
-                self._send(writer, 200, body, content_type="application/json")
+                if self._loop is None:
+                    self._send(writer, 503, '{"error": "not ready"}',
+                               content_type="application/json")
+                else:
+                    snap = self._loop.bot_snapshot()
+                    body = json.dumps(snap.__dict__, cls=_DecimalEncoder, indent=2)
+                    self._send(writer, 200, body, content_type="application/json")
             elif path == "/api/lots" and method == "GET":
-                lots = self._loop._ledger.open_lots()
+                if self._loop is None:
+                    self._send(writer, 503, '{"error": "not ready"}',
+                               content_type="application/json")
+                else:
+                    lots = self._loop._ledger.open_lots()
                 data = [
                     {"lot_id": lot.lot_id[:8], "qty": str(lot.remaining_qty_btc),
                      "days_held": lot.days_held, "tax_free": lot.is_tax_free}

@@ -69,17 +69,22 @@ class TaxReportGenerator:
         taxable = [d for d in disposals if d.is_taxable]
         tax_free = [d for d in disposals if not d.is_taxable]
 
-        total_proceeds = sum(d.sale_total_eur for d in disposals)
-        total_cost = sum(d.cost_basis_eur for d in disposals)
+        total_proceeds = sum((d.sale_total_eur for d in disposals), Decimal("0"))
+        total_cost = sum((d.cost_basis_eur for d in disposals), Decimal("0"))
         total_fees = sum(
-            d.sale_fee_usd / d.exchange_rate_eur_usd
+            (d.sale_fee_usd / d.exchange_rate_eur_usd
             for d in disposals
-            if d.exchange_rate_eur_usd > 0
+            if d.exchange_rate_eur_usd > 0),
+            Decimal("0"),
         )
 
-        taxable_gain = sum(d.gain_loss_eur for d in taxable if d.gain_loss_eur > 0)
-        taxable_loss = sum(d.gain_loss_eur for d in taxable if d.gain_loss_eur < 0)
-        net_taxable = sum(d.gain_loss_eur for d in taxable)
+        taxable_gain = sum(
+            (d.gain_loss_eur for d in taxable if d.gain_loss_eur > 0), Decimal("0"),
+        )
+        taxable_loss = sum(
+            (d.gain_loss_eur for d in taxable if d.gain_loss_eur < 0), Decimal("0"),
+        )
+        net_taxable = sum((d.gain_loss_eur for d in taxable), Decimal("0"))
 
         return AnnualSummary(
             year=year,
