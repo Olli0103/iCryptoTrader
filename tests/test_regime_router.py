@@ -145,6 +145,35 @@ class TestMetrics:
         assert router.ewma_volatility > 0
 
 
+class TestVWAP:
+    def test_no_trades_returns_none(self) -> None:
+        router = RegimeRouter()
+        assert router.vwap is None
+
+    def test_single_trade(self) -> None:
+        router = RegimeRouter()
+        router.update_trade(Decimal("85000"), Decimal("0.1"))
+        assert router.vwap == Decimal("85000")
+
+    def test_volume_weighted(self) -> None:
+        router = RegimeRouter()
+        # 0.1 BTC @ $85000 + 0.3 BTC @ $86000
+        # VWAP = (85000*0.1 + 86000*0.3) / (0.1 + 0.3) = 34300/0.4 = 85750
+        router.update_trade(Decimal("85000"), Decimal("0.1"))
+        router.update_trade(Decimal("86000"), Decimal("0.3"))
+        assert router.vwap == Decimal("85750")
+
+    def test_vwap_updates_incrementally(self) -> None:
+        router = RegimeRouter()
+        router.update_trade(Decimal("85000"), Decimal("1.0"))
+        vwap1 = router.vwap
+        router.update_trade(Decimal("86000"), Decimal("1.0"))
+        vwap2 = router.vwap
+        assert vwap2 is not None
+        assert vwap1 is not None
+        assert vwap2 > vwap1
+
+
 class TestGridLevelRecommendations:
     def test_range_bound_full_grid(self) -> None:
         router = RegimeRouter(default_buy_levels=5, default_sell_levels=5)

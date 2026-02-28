@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from icryptotrader.types import TaxVetoDecision
+from icryptotrader.types import HarvestRecommendation, TaxVetoDecision
 
 if TYPE_CHECKING:
     from icryptotrader.tax.fifo_ledger import FIFOLedger
@@ -200,6 +200,82 @@ class TaxAgent:
     def days_until_unlock(self) -> int | None:
         """Days until the next lot becomes tax-free."""
         return self._ledger.days_until_next_free()
+
+    def recommend_loss_harvest(
+        self,
+        current_price_usd: Decimal,
+        eur_usd_rate: Decimal,
+        max_harvests: int = 3,
+        min_loss_eur: Decimal = Decimal("50"),
+        target_net_eur: Decimal | None = None,
+    ) -> list[HarvestRecommendation]:
+        """Recommend lots to sell for tax-loss harvesting.
+
+        Identifies underwater lots (unrealized loss) that could be sold to
+        offset realized taxable gains, ideally keeping net taxable income
+        below the annual Freigrenze (EUR 1,000).
+
+        Rules:
+        1. Only harvest if YTD taxable gains > 0 (no point if net negative)
+        2. Never harvest lots within near_threshold_days of maturity
+        3. Skip lots with losses below min_loss_eur (avoid dust)
+        4. Cap at max_harvests per call
+        5. Stop once enough losses are harvested to reach target_net_eur
+        """
+        ytd_gain = self._ledger.taxable_gain_ytd()
+        if ytd_gain <= 0:
+            return []
+
+        target = target_net_eur if target_net_eur is not None else (
+            self._annual_exemption_eur * Decimal("0.8")
+        )
+
+        underwater = self._ledger.underwater_lots(
+            current_price_usd, eur_usd_rate, self._near_threshold_days,
+        )
+
+        recommendations: list[HarvestRecommendation] = []
+        cumulative_loss = Decimal("0")
+
+        for lot, estimated_loss in underwater:
+            if len(recommendations) >= max_harvests:
+                break
+
+            # Skip trivial losses
+            if abs(estimated_loss) < min_loss_eur:
+                continue
+
+            # Check if we still need to harvest more
+            projected_net = ytd_gain + cumulative_loss + estimated_loss
+            if projected_net < 0:
+                # Would overshoot into net loss — skip or reduce
+                continue
+
+            recommendations.append(HarvestRecommendation(
+                lot_id=lot.lot_id,
+                qty_btc=lot.remaining_qty_btc,
+                estimated_loss_eur=estimated_loss,
+                current_price_usd=current_price_usd,
+                cost_basis_per_btc_eur=lot.cost_basis_per_btc_eur,
+                days_held=lot.days_held,
+                reason="offset_gains" if ytd_gain > self._annual_exemption_eur
+                       else "freigrenze_optimization",
+            ))
+            cumulative_loss += estimated_loss
+
+            # Check if we've harvested enough to reach target
+            if ytd_gain + cumulative_loss <= target:
+                break
+
+        if recommendations:
+            total_loss = sum(r.estimated_loss_eur for r in recommendations)
+            logger.info(
+                "Tax-loss harvest: %d lots recommended, est. total loss EUR %.2f "
+                "(YTD gain EUR %.2f → projected net EUR %.2f)",
+                len(recommendations), total_loss, ytd_gain, ytd_gain + total_loss,
+            )
+
+        return recommendations
 
     def _estimate_gain(
         self,

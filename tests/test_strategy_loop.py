@@ -388,3 +388,80 @@ class TestMetrics:
         loop = _make_loop()
         commands = loop.tick(mid_price=Decimal("85000"))
         assert loop.commands_issued == len(commands)
+
+
+class TestLedgerPersistence:
+    def test_auto_save_on_buy_fill(self, tmp_path) -> None:
+        """Ledger is saved to disk after a buy fill."""
+        ledger_file = tmp_path / "ledger.json"
+        loop = _make_loop()
+        loop._ledger_path = ledger_file
+
+        # Simulate a buy fill
+        from unittest.mock import MagicMock
+
+        slot = MagicMock()
+        slot.side = Side.BUY
+        slot.slot_id = 0
+
+        loop.on_fill(slot, {
+            "last_qty": "0.01",
+            "last_price": "85000",
+            "fee": "1.00",
+            "order_id": "O1",
+            "trade_id": "T1",
+        })
+
+        assert ledger_file.exists()
+        assert loop._ledger.total_btc() == Decimal("0.01")
+
+    def test_auto_save_on_sell_fill(self, tmp_path) -> None:
+        """Ledger is saved to disk after a sell fill."""
+        ledger_file = tmp_path / "ledger.json"
+        loop = _make_loop()
+        loop._ledger_path = ledger_file
+
+        # Add a lot first
+        loop._ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("80000"),
+            purchase_fee_usd=Decimal("1"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+
+        from unittest.mock import MagicMock
+
+        slot = MagicMock()
+        slot.side = Side.SELL
+        slot.slot_id = 0
+
+        loop.on_fill(slot, {
+            "last_qty": "0.005",
+            "last_price": "85000",
+            "fee": "0.50",
+            "order_id": "O2",
+            "trade_id": "T2",
+        })
+
+        assert ledger_file.exists()
+        assert loop._ledger.total_btc() == Decimal("0.005")
+
+    def test_no_save_without_ledger_path(self) -> None:
+        """No save attempted when ledger_path is None."""
+        loop = _make_loop()
+        assert loop._ledger_path is None
+
+        from unittest.mock import MagicMock
+
+        slot = MagicMock()
+        slot.side = Side.BUY
+        slot.slot_id = 0
+
+        # Should not raise even without a path
+        loop.on_fill(slot, {
+            "last_qty": "0.01",
+            "last_price": "85000",
+            "fee": "0",
+            "order_id": "O3",
+            "trade_id": "T3",
+        })

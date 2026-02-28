@@ -199,8 +199,18 @@ class RiskManager:
         # Check if we're in cooldown
         if self._velocity_frozen:
             if now >= self._velocity_unfreeze_at:
+                # Hysteresis: only unfreeze if current velocity is below
+                # recovery threshold (50% of freeze threshold)
+                if len(self._price_history) >= 2:
+                    oldest_price = self._price_history[0][1]
+                    if oldest_price > 0:
+                        current_vel = abs(float((price - oldest_price) / oldest_price))
+                        if current_vel >= self._velocity_freeze_pct * 0.5:
+                            # Still too volatile — extend cooldown
+                            self._velocity_unfreeze_at = now + self._velocity_cooldown_sec
+                            return True
                 self._velocity_frozen = False
-                logger.info("Price velocity circuit breaker: unfrozen")
+                logger.info("Price velocity circuit breaker: unfrozen (hysteresis passed)")
             else:
                 return True
 

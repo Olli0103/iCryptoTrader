@@ -45,6 +45,10 @@ class TaxConfig:
     near_threshold_days: int = 330
     annual_exemption_eur: Decimal = Decimal("1000")
     emergency_dd_override_pct: float = 0.20
+    harvest_enabled: bool = False
+    harvest_min_loss_eur: Decimal = Decimal("50")
+    harvest_max_per_day: int = 3
+    harvest_target_net_eur: Decimal = Decimal("800")
 
 
 @dataclass
@@ -54,6 +58,7 @@ class RegimeAllocation:
     btc_min_pct: float = 0.40
     grid_levels: int = 5
     signal_enabled: bool = True
+    order_size_scale: float = 1.0  # Multiplier for order_size_usd per regime
 
 
 @dataclass
@@ -61,25 +66,25 @@ class RegimeConfig:
     range_bound: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.50, btc_max_pct=0.60, btc_min_pct=0.40,
-            grid_levels=5, signal_enabled=True,
+            grid_levels=5, signal_enabled=True, order_size_scale=1.0,
         )
     )
     trending_up: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.70, btc_max_pct=0.80, btc_min_pct=0.55,
-            grid_levels=3, signal_enabled=True,
+            grid_levels=3, signal_enabled=True, order_size_scale=0.75,
         )
     )
     trending_down: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.30, btc_max_pct=0.40, btc_min_pct=0.15,
-            grid_levels=3, signal_enabled=True,
+            grid_levels=3, signal_enabled=True, order_size_scale=0.75,
         )
     )
     chaos: RegimeAllocation = field(
         default_factory=lambda: RegimeAllocation(
             btc_target_pct=0.00, btc_max_pct=0.05, btc_min_pct=0.00,
-            grid_levels=0, signal_enabled=False,
+            grid_levels=0, signal_enabled=False, order_size_scale=0.5,
         )
     )
 
@@ -100,6 +105,16 @@ class RateLimitConfig:
 
 
 @dataclass
+class BollingerConfig:
+    enabled: bool = True
+    window: int = 20
+    multiplier: float = 2.0
+    spacing_scale: float = 0.5
+    min_spacing_bps: Decimal = Decimal("15")
+    max_spacing_bps: Decimal = Decimal("200")
+
+
+@dataclass
 class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
@@ -107,10 +122,35 @@ class TelegramConfig:
 
 
 @dataclass
+class AISignalConfig:
+    """Configuration for the AI Signal Engine (multi-provider)."""
+
+    enabled: bool = False
+    provider: str = "gemini"  # "gemini", "anthropic", "openai"
+    api_key: str = ""
+    model: str = "gemini-2.0-flash"
+    temperature: float = 0.2
+    max_tokens: int = 512
+    cooldown_sec: int = 300  # Min seconds between AI calls
+    weight: float = 0.3  # Signal weight vs grid (0.0-1.0)
+    timeout_sec: int = 10  # HTTP timeout for AI provider
+
+
+@dataclass
+class MetricsConfig:
+    """Configuration for structured metrics export."""
+
+    enabled: bool = False
+    port: int = 9090
+    prefix: str = "icryptotrader"
+
+
+@dataclass
 class Config:
     pair: str = "XBT/USD"
     log_level: str = "INFO"
     data_dir: str = "data"
+    ledger_path: str = "data/fifo_ledger.json"
     kraken: KrakenConfig = field(default_factory=KrakenConfig)
     grid: GridConfig = field(default_factory=GridConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -118,7 +158,10 @@ class Config:
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     ws: WSConfig = field(default_factory=WSConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    bollinger: BollingerConfig = field(default_factory=BollingerConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    ai_signal: AISignalConfig = field(default_factory=AISignalConfig)
+    metrics: MetricsConfig = field(default_factory=MetricsConfig)
 
 
 def _apply_toml_section(obj: object, data: dict) -> None:  # type: ignore[type-arg]
@@ -136,6 +179,84 @@ def _apply_toml_section(obj: object, data: dict) -> None:  # type: ignore[type-a
             setattr(obj, key, value)
 
 
+class ConfigError(ValueError):
+    """Raised when configuration validation fails."""
+
+
+def validate_config(cfg: Config) -> list[str]:
+    """Validate config values and return list of errors (empty = valid)."""
+    errors: list[str] = []
+
+    # Grid
+    if cfg.grid.levels < 0:
+        errors.append("grid.levels must be >= 0")
+    if cfg.grid.order_size_usd <= 0:
+        errors.append("grid.order_size_usd must be > 0")
+    if cfg.grid.min_spacing_bps <= 0:
+        errors.append("grid.min_spacing_bps must be > 0")
+
+    # Risk — ordering and ranges
+    if not (0 < cfg.risk.max_portfolio_drawdown_pct <= 1.0):
+        errors.append("risk.max_portfolio_drawdown_pct must be in (0, 1.0]")
+    if not (0 < cfg.risk.emergency_drawdown_pct <= 1.0):
+        errors.append("risk.emergency_drawdown_pct must be in (0, 1.0]")
+    if cfg.risk.emergency_drawdown_pct < cfg.risk.max_portfolio_drawdown_pct:
+        errors.append("risk.emergency_drawdown_pct must be >= max_portfolio_drawdown_pct")
+    if cfg.risk.price_velocity_freeze_pct <= 0:
+        errors.append("risk.price_velocity_freeze_pct must be > 0")
+    if cfg.risk.price_velocity_window_sec <= 0:
+        errors.append("risk.price_velocity_window_sec must be > 0")
+
+    # Tax
+    if cfg.tax.holding_period_days < 1:
+        errors.append("tax.holding_period_days must be >= 1")
+    if cfg.tax.near_threshold_days >= cfg.tax.holding_period_days:
+        errors.append("tax.near_threshold_days must be < holding_period_days")
+    if cfg.tax.annual_exemption_eur < 0:
+        errors.append("tax.annual_exemption_eur must be >= 0")
+    if cfg.tax.harvest_max_per_day < 1:
+        errors.append("tax.harvest_max_per_day must be >= 1")
+
+    # Regime — allocation ordering
+    for name in ("range_bound", "trending_up", "trending_down", "chaos"):
+        alloc = getattr(cfg.regime, name)
+        if alloc.btc_min_pct > alloc.btc_target_pct:
+            errors.append(f"regime.{name}: btc_min_pct must be <= btc_target_pct")
+        if alloc.btc_target_pct > alloc.btc_max_pct:
+            errors.append(f"regime.{name}: btc_target_pct must be <= btc_max_pct")
+        if not (0 < alloc.order_size_scale <= 5.0):
+            errors.append(f"regime.{name}: order_size_scale must be in (0, 5.0]")
+
+    # Bollinger
+    if cfg.bollinger.window < 2:
+        errors.append("bollinger.window must be >= 2")
+    if cfg.bollinger.min_spacing_bps >= cfg.bollinger.max_spacing_bps:
+        errors.append("bollinger.min_spacing_bps must be < max_spacing_bps")
+
+    # WS
+    if cfg.ws.cancel_after_timeout_sec < 1:
+        errors.append("ws.cancel_after_timeout_sec must be >= 1")
+    if cfg.ws.heartbeat_interval_sec < 1:
+        errors.append("ws.heartbeat_interval_sec must be >= 1")
+
+    # Rate limit
+    if cfg.rate_limit.max_counter < 1:
+        errors.append("rate_limit.max_counter must be >= 1")
+    if not (0 < cfg.rate_limit.headroom_pct <= 1.0):
+        errors.append("rate_limit.headroom_pct must be in (0, 1.0]")
+
+    # AI Signal
+    if cfg.ai_signal.enabled:
+        if not cfg.ai_signal.api_key:
+            errors.append("ai_signal.api_key required when ai_signal.enabled=true")
+        if cfg.ai_signal.provider not in ("gemini", "anthropic", "openai"):
+            errors.append("ai_signal.provider must be 'gemini', 'anthropic', or 'openai'")
+        if not (0.0 <= cfg.ai_signal.weight <= 1.0):
+            errors.append("ai_signal.weight must be in [0.0, 1.0]")
+
+    return errors
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load config from TOML file, falling back to defaults."""
     cfg = Config()
@@ -147,4 +268,11 @@ def load_config(path: Path | None = None) -> Config:
         logger.info("Loaded config from %s", config_path)
     else:
         logger.info("No config file at %s, using defaults", config_path)
+
+    errors = validate_config(cfg)
+    if errors:
+        for err in errors:
+            logger.error("Config validation error: %s", err)
+        raise ConfigError(f"Invalid configuration: {'; '.join(errors)}")
+
     return cfg

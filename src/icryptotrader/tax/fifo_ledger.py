@@ -7,6 +7,7 @@ Lots held >365 days are tax-free (Haltefrist überschritten).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import uuid
@@ -296,6 +297,39 @@ class FIFOLedger:
     def open_lots(self) -> list[TaxLot]:
         return [lot for lot in self._lots if lot.status != LotStatus.CLOSED]
 
+    def underwater_lots(
+        self,
+        current_price_usd: Decimal,
+        eur_usd_rate: Decimal,
+        near_threshold_days: int = 330,
+    ) -> list[tuple[TaxLot, Decimal]]:
+        """Return open lots with unrealized losses, sorted by loss magnitude.
+
+        Returns list of (lot, estimated_loss_eur) where loss_eur < 0.
+        Excludes:
+        - Closed lots
+        - Tax-free lots (selling at a loss has no tax benefit)
+        - Lots within near_threshold_days of maturity (protect for Haltefrist)
+        """
+        results: list[tuple[TaxLot, Decimal]] = []
+        for lot in self._lots:
+            if lot.status == LotStatus.CLOSED:
+                continue
+            if lot.is_tax_free:
+                continue
+            if lot.days_held >= near_threshold_days:
+                continue
+
+            current_value_eur = (lot.remaining_qty_btc * current_price_usd) / eur_usd_rate
+            cost_basis_eur = (lot.remaining_qty_btc / lot.quantity_btc) * lot.purchase_total_eur
+            unrealized_pnl = current_value_eur - cost_basis_eur
+
+            if unrealized_pnl < 0:
+                results.append((lot, unrealized_pnl))
+
+        results.sort(key=lambda x: x[1])  # Most negative first
+        return results
+
     def all_disposals(self, year: int | None = None) -> list[Disposal]:
         """All disposals, optionally filtered by tax year."""
         disposals: list[Disposal] = []
@@ -317,15 +351,32 @@ class FIFOLedger:
     # --- Persistence ---
 
     def save(self, path: Path) -> None:
-        """Save ledger to JSON file."""
-        data = []
-        for lot in self._lots:
-            lot_dict = _lot_to_dict(lot)
-            data.append(lot_dict)
+        """Save ledger to JSON file using atomic write (temp + rename + fsync).
+
+        Prevents data loss if the process crashes during write. The rename
+        operation is atomic on POSIX filesystems, so readers always see
+        either the old or new file — never a partial write.
+        """
+        import os
+        import tempfile
+
+        data = [_lot_to_dict(lot) for lot in self._lots]
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        logger.info("FIFO ledger saved to %s (%d lots)", path, len(data))
+
+        # Write to temp file in the same directory, then atomic rename
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+            logger.info("FIFO ledger saved to %s (%d lots)", path, len(data))
+        except BaseException:
+            # Clean up temp file on any failure
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
     def load(self, path: Path) -> None:
         """Load ledger from JSON file."""

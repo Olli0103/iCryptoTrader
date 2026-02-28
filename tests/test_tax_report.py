@@ -186,3 +186,32 @@ class TestTextSummary:
         assert "Total disposals" in text
         assert "Taxable" in text
         assert "Freigrenze" in text
+
+
+class TestAutoGenerateAnnualReport:
+    def test_auto_generates_csv_and_json(self, tmp_path: Path) -> None:
+        ledger = _make_ledger_with_trade()
+        gen = TaxReportGenerator(ledger)
+        year = datetime.now(UTC).year
+        result = gen.auto_generate_annual_report(year, tmp_path)
+        assert result is not None
+        csv_path, json_path = result
+        assert csv_path.exists()
+        assert json_path.exists()
+        assert "anlage_so" in csv_path.name
+        assert "anlage_so" in json_path.name
+
+    def test_auto_report_empty_year_returns_none(self, tmp_path: Path) -> None:
+        ledger = FIFOLedger()
+        gen = TaxReportGenerator(ledger)
+        result = gen.auto_generate_annual_report(2020, tmp_path)
+        assert result is None
+
+    def test_auto_report_creates_subdirectory(self, tmp_path: Path) -> None:
+        ledger = _make_ledger_with_trade()
+        gen = TaxReportGenerator(ledger)
+        year = datetime.now(UTC).year
+        result = gen.auto_generate_annual_report(year, tmp_path)
+        assert result is not None
+        csv_path, _ = result
+        assert csv_path.parent.name == "tax_reports"

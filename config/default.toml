@@ -1,6 +1,7 @@
 pair = "XBT/USD"
 log_level = "INFO"
 data_dir = "data"
+ledger_path = "data/fifo_ledger.json"
 
 [kraken]
 api_key = ""
@@ -27,6 +28,10 @@ holding_period_days = 365
 near_threshold_days = 330
 annual_exemption_eur = "1000"
 emergency_dd_override_pct = 0.20
+harvest_enabled = false
+harvest_min_loss_eur = "50"
+harvest_max_per_day = 3
+harvest_target_net_eur = "800"
 
 [regime.range_bound]
 btc_target_pct = 0.50
@@ -34,6 +39,7 @@ btc_max_pct = 0.60
 btc_min_pct = 0.40
 grid_levels = 5
 signal_enabled = true
+order_size_scale = 1.0
 
 [regime.trending_up]
 btc_target_pct = 0.70
@@ -41,6 +47,7 @@ btc_max_pct = 0.80
 btc_min_pct = 0.55
 grid_levels = 3
 signal_enabled = true
+order_size_scale = 0.75
 
 [regime.trending_down]
 btc_target_pct = 0.30
@@ -48,6 +55,7 @@ btc_max_pct = 0.40
 btc_min_pct = 0.15
 grid_levels = 3
 signal_enabled = true
+order_size_scale = 0.75
 
 [regime.chaos]
 btc_target_pct = 0.00
@@ -55,6 +63,7 @@ btc_max_pct = 0.05
 btc_min_pct = 0.00
 grid_levels = 0
 signal_enabled = false
+order_size_scale = 0.5
 
 [ws]
 cancel_after_timeout_sec = 60
@@ -67,7 +76,31 @@ max_counter = 180
 decay_rate = 3.75
 headroom_pct = 0.80
 
+[bollinger]
+enabled = true
+window = 20
+multiplier = 2.0
+spacing_scale = 0.5
+min_spacing_bps = "15"
+max_spacing_bps = "200"
+
 [telegram]
 enabled = false
 bot_token = ""
 chat_id = ""
+
+[ai_signal]
+enabled = false
+provider = "gemini"        # "gemini", "anthropic", "openai"
+api_key = ""
+model = "gemini-2.0-flash"
+temperature = 0.2
+max_tokens = 512
+cooldown_sec = 300         # Min seconds between AI calls
+weight = 0.3               # Signal weight vs grid (0.0-1.0)
+timeout_sec = 10
+
+[metrics]
+enabled = false
+port = 9090
+prefix = "icryptotrader"

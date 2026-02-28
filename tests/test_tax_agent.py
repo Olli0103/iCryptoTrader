@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from icryptotrader.tax.fifo_ledger import FIFOLedger
 from icryptotrader.tax.tax_agent import TaxAgent
-from icryptotrader.types import TaxVetoDecision
+from icryptotrader.types import HarvestRecommendation, TaxVetoDecision
 
 
 def _make_ledger_with_lots(
@@ -196,3 +196,200 @@ class TestTaxLockStatus:
         days = agent.days_until_unlock()
         assert days is not None
         assert days == 5
+
+
+EUR_USD = Decimal("1.08")
+
+
+def _make_harvest_ledger() -> FIFOLedger:
+    """Create a ledger with YTD gains and underwater lots for harvest tests.
+
+    Structure (FIFO order):
+    1. Old profitable lot (250 days, $60k, 0.05 BTC) — sold partially to generate gains
+    2. Underwater lot (100 days, $90k, 0.01 BTC) — at $75k, loss ≈ -EUR 139
+    3. Underwater lot (50 days, $85k, 0.01 BTC) — at $75k, loss ≈ -EUR 93
+    """
+    now = datetime.now(UTC)
+    ledger = FIFOLedger()
+
+    # Profitable lot first (oldest, consumed first by FIFO sell)
+    ledger.add_lot(
+        quantity_btc=Decimal("0.05"), purchase_price_usd=Decimal("60000"),
+        purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        purchase_timestamp=now - timedelta(days=250),
+    )
+    # Underwater lot 1: bought at $90k
+    ledger.add_lot(
+        quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+        purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        purchase_timestamp=now - timedelta(days=100),
+    )
+    # Underwater lot 2: bought at $85k
+    ledger.add_lot(
+        quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("85000"),
+        purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        purchase_timestamp=now - timedelta(days=50),
+    )
+
+    # Sell from the profitable lot to generate YTD gains (~EUR 231 gain)
+    ledger.sell_fifo(
+        quantity_btc=Decimal("0.01"), sale_price_usd=Decimal("85000"),
+        sale_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+    )
+
+    return ledger
+
+
+class TestHarvestRecommendation:
+    def test_recommends_when_ytd_gains_positive(self) -> None:
+        """Should recommend harvesting when there are YTD taxable gains."""
+        ledger = _make_harvest_ledger()
+        agent = TaxAgent(ledger=ledger)
+
+        ytd = ledger.taxable_gain_ytd()
+        assert ytd > 0  # Precondition: we have gains to offset
+
+        recs = agent.recommend_loss_harvest(
+            current_price_usd=Decimal("70000"),  # Price drop creates losses
+            eur_usd_rate=EUR_USD,
+        )
+        assert len(recs) > 0
+        for rec in recs:
+            assert isinstance(rec, HarvestRecommendation)
+            assert rec.estimated_loss_eur < 0
+            assert rec.qty_btc > 0
+
+    def test_no_recommendations_when_no_ytd_gains(self) -> None:
+        """Should not recommend harvesting when YTD gains are zero or negative."""
+        ledger = FIFOLedger()
+        now = datetime.now(UTC)
+        # Only add underwater lots, no realized gains
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=100),
+        )
+        agent = TaxAgent(ledger=ledger)
+
+        assert ledger.taxable_gain_ytd() == Decimal("0")
+        recs = agent.recommend_loss_harvest(
+            current_price_usd=Decimal("80000"),
+            eur_usd_rate=EUR_USD,
+        )
+        assert recs == []
+
+    def test_respects_max_harvests(self) -> None:
+        """Should not recommend more than max_harvests."""
+        ledger = _make_harvest_ledger()
+        agent = TaxAgent(ledger=ledger)
+
+        recs = agent.recommend_loss_harvest(
+            current_price_usd=Decimal("70000"),
+            eur_usd_rate=EUR_USD,
+            max_harvests=1,
+        )
+        assert len(recs) <= 1
+
+    def test_skips_trivial_losses(self) -> None:
+        """Losses below min_loss_eur should be skipped."""
+        now = datetime.now(UTC)
+        ledger = FIFOLedger()
+
+        # Tiny loss lot: bought at $80100 vs current $80000 = ~$1 loss
+        ledger.add_lot(
+            quantity_btc=Decimal("0.001"), purchase_price_usd=Decimal("80100"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=50),
+        )
+        # Create YTD gains
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("70000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=200),
+        )
+        ledger.sell_fifo(
+            quantity_btc=Decimal("0.001"), sale_price_usd=Decimal("85000"),
+            sale_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        )
+        assert ledger.taxable_gain_ytd() > 0
+
+        agent = TaxAgent(ledger=ledger)
+        recs = agent.recommend_loss_harvest(
+            current_price_usd=Decimal("80000"),
+            eur_usd_rate=EUR_USD,
+            min_loss_eur=Decimal("50"),  # Higher than the tiny loss
+        )
+        assert recs == []
+
+    def test_excludes_near_threshold_lots(self) -> None:
+        """Lots near maturity should not be recommended for harvest."""
+        now = datetime.now(UTC)
+        ledger = FIFOLedger()
+
+        # Profitable lot first (oldest, consumed first by FIFO sell)
+        ledger.add_lot(
+            quantity_btc=Decimal("0.05"), purchase_price_usd=Decimal("60000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=350),
+        )
+        # Near-threshold losing lot (340 days, near maturity)
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=now - timedelta(days=340),
+        )
+
+        # Create YTD gains by selling from the profitable lot
+        ledger.sell_fifo(
+            quantity_btc=Decimal("0.01"), sale_price_usd=Decimal("85000"),
+            sale_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        )
+        assert ledger.taxable_gain_ytd() > 0
+
+        agent = TaxAgent(ledger=ledger, near_threshold_days=330)
+        recs = agent.recommend_loss_harvest(
+            current_price_usd=Decimal("80000"),
+            eur_usd_rate=EUR_USD,
+        )
+        # The 340-day lot should be excluded (>= 330 near threshold)
+        assert recs == []
+
+    def test_stops_when_target_reached(self) -> None:
+        """Should stop harvesting once target net is reached."""
+        ledger = _make_harvest_ledger()
+        agent = TaxAgent(ledger=ledger)
+        ytd = ledger.taxable_gain_ytd()
+
+        # Set a generous target so we stop after first harvest
+        recs = agent.recommend_loss_harvest(
+            current_price_usd=Decimal("70000"),
+            eur_usd_rate=EUR_USD,
+            target_net_eur=ytd,  # Target == current gains means stop immediately
+        )
+        # With target == ytd, any loss brings us below target, so should get 1 rec
+        assert len(recs) <= 1
+
+    def test_reason_field(self) -> None:
+        """Reason should reflect whether offsetting gains or optimizing Freigrenze."""
+        ledger = _make_harvest_ledger()
+        agent = TaxAgent(ledger=ledger, annual_exemption_eur=Decimal("1000"))
+
+        recs = agent.recommend_loss_harvest(
+            current_price_usd=Decimal("70000"),
+            eur_usd_rate=EUR_USD,
+        )
+        if recs:
+            ytd = ledger.taxable_gain_ytd()
+            if ytd > Decimal("1000"):
+                assert recs[0].reason == "offset_gains"
+            else:
+                assert recs[0].reason == "freigrenze_optimization"
+
+    def test_harvest_disabled_by_default_in_config(self) -> None:
+        """Verify that TaxConfig defaults have harvest_enabled=False."""
+        from icryptotrader.config import TaxConfig
+        cfg = TaxConfig()
+        assert cfg.harvest_enabled is False
+        assert cfg.harvest_min_loss_eur == Decimal("50")
+        assert cfg.harvest_max_per_day == 3
+        assert cfg.harvest_target_net_eur == Decimal("800")

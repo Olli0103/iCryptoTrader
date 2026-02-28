@@ -81,10 +81,12 @@ class WSPrivate:
         self._reconnect_count = 0
         self._req_id_counter = 1000  # Offset from WS1 to avoid collisions
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._http_client: httpx.AsyncClient | None = None
 
         # Callbacks
         self._execution_callbacks: list[ExecutionCallback] = []
         self._ack_callbacks: list[AckCallback] = []
+        self._balance_callbacks: list[ExecutionCallback] = []
 
         # State flags
         self.is_connected: bool = False
@@ -104,9 +106,14 @@ class WSPrivate:
         """Register callback for command acks (add_order, amend_order, cancel_order responses)."""
         self._ack_callbacks.append(callback)
 
+    def on_balance(self, callback: ExecutionCallback) -> None:
+        """Register callback for balances channel updates."""
+        self._balance_callbacks.append(callback)
+
     async def run(self) -> None:
         """Main loop: connect, subscribe, heartbeat, receive, reconnect."""
         self._running = True
+        self._http_client = httpx.AsyncClient(timeout=10.0)
         while self._running:
             try:
                 await self._connect_and_run()
@@ -137,6 +144,9 @@ class WSPrivate:
                 await self.send_cancel_after(0)
             await self._ws.close()
             self._ws = None
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
         self.is_connected = False
         self._connected.clear()
 
@@ -275,7 +285,7 @@ class WSPrivate:
         self._ws = None
 
     async def _subscribe_executions(self) -> None:
-        """Subscribe to executions channel with order and trade snapshots."""
+        """Subscribe to executions and balances channels."""
         if not self._ws:
             return
         req_id = self.next_req_id()
@@ -290,6 +300,16 @@ class WSPrivate:
         )
         await self._ws.send(frame)
         logger.info("WS2 executions subscription sent (snap_orders=true, snap_trades=true)")
+
+        # Subscribe to balances channel for real-time balance updates
+        bal_req_id = self.next_req_id()
+        bal_frame = ws_codec.encode_subscribe(
+            "balances",
+            params={"token": self._token, "snap_balances": True},
+            req_id=bal_req_id,
+        )
+        await self._ws.send(bal_frame)
+        logger.info("WS2 balances subscription sent")
 
     async def _heartbeat_loop(self) -> None:
         """Periodically re-arm the dead man's switch."""
@@ -335,21 +355,20 @@ class WSPrivate:
             sig_b64 = base64.b64encode(signature.digest()).decode()
 
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(
-                        f"{self._rest_url}{url_path}",
-                        data=data,
-                        headers={
-                            "API-Key": self._api_key,
-                            "API-Sign": sig_b64,
-                        },
-                        timeout=10.0,
-                    )
-                    # Auth errors (4xx) should not be retried
-                    if 400 <= resp.status_code < 500:
-                        resp.raise_for_status()
+                client = self._http_client or httpx.AsyncClient(timeout=10.0)
+                resp = await client.post(
+                    f"{self._rest_url}{url_path}",
+                    data=data,
+                    headers={
+                        "API-Key": self._api_key,
+                        "API-Sign": sig_b64,
+                    },
+                )
+                # Auth errors (4xx) should not be retried
+                if 400 <= resp.status_code < 500:
                     resp.raise_for_status()
-                    result = resp.json()
+                resp.raise_for_status()
+                result = resp.json()
 
                 if result.get("error"):
                     raise WSPrivateError(
@@ -385,7 +404,12 @@ class WSPrivate:
                         cb(msg)
                     except Exception:
                         logger.exception("WS2 execution callback error")
-            # Other private channels (balances) can be added here
+            elif msg.channel == "balances":
+                for cb in self._balance_callbacks:
+                    try:
+                        cb(msg)
+                    except Exception:
+                        logger.exception("WS2 balance callback error")
 
         elif msg.msg_type in (
             MessageType.ADD_ORDER_RESP,
