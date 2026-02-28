@@ -80,11 +80,20 @@ class RegimeRouter:
         self._default_buy = default_buy_levels
         self._default_sell = default_sell_levels
 
-        # EWMA state
+        # EWMA state (tick-level, kept for backward compat)
         self._ewma_var: float = 0.0
         self._ewma_alpha: float = 2.0 / (ewma_span + 1)
         self._last_price: Decimal | None = None
         self._price_initialized = False
+
+        # Multi-timeframe volatility: 1m, 5m, 15m rolling windows
+        # Stores (timestamp, price) and computes true time-weighted returns
+        self._vol_windows: dict[int, deque[tuple[float, Decimal]]] = {
+            60: deque(maxlen=600),    # 1-min samples (keep 10 min of ticks)
+            300: deque(maxlen=600),   # 5-min samples
+            900: deque(maxlen=600),   # 15-min samples
+        }
+        self._vol_estimates: dict[int, float] = {60: 0.0, 300: 0.0, 900: 0.0}
 
         # Price history for momentum
         self._price_history: deque[tuple[float, Decimal]] = deque(maxlen=momentum_window)
@@ -110,7 +119,21 @@ class RegimeRouter:
 
     @property
     def ewma_volatility(self) -> float:
-        """EWMA volatility estimate (tick-level, not annualized)."""
+        """Multi-timeframe volatility: weighted blend of 1m/5m/15m windows.
+
+        Falls back to tick-level EWMA if insufficient data in windows.
+        """
+        v1 = self._vol_estimates.get(60, 0.0)
+        v5 = self._vol_estimates.get(300, 0.0)
+        v15 = self._vol_estimates.get(900, 0.0)
+
+        # Use multi-timeframe if we have at least 1-minute data
+        if v1 > 0:
+            # Weight: 50% 1-min, 30% 5-min, 20% 15-min
+            blended = 0.5 * v1 + 0.3 * v5 + 0.2 * v15
+            return blended
+
+        # Fallback to tick-level EWMA
         return float(self._ewma_var ** 0.5)
 
     def update_price(self, price: Decimal) -> None:
@@ -118,6 +141,7 @@ class RegimeRouter:
         now = time.monotonic()
         self._price_history.append((now, price))
 
+        # Tick-level EWMA (backward compat)
         if self._last_price is not None and self._last_price > 0:
             ret = float((price - self._last_price) / self._last_price)
             if self._price_initialized:
@@ -130,6 +154,55 @@ class RegimeRouter:
                 self._price_initialized = True
 
         self._last_price = price
+
+        # Feed multi-timeframe volatility windows
+        for window_sec, buf in self._vol_windows.items():
+            buf.append((now, price))
+            self._vol_estimates[window_sec] = self._compute_windowed_vol(
+                buf, window_sec,
+            )
+
+    def _compute_windowed_vol(
+        self,
+        buf: deque[tuple[float, Decimal]],
+        window_sec: int,
+    ) -> float:
+        """Compute realized volatility over a rolling time window.
+
+        Uses the actual elapsed time for scaling (not the nominal window),
+        so fast-ticking tests and slow-ticking prod both get correct values.
+        """
+        if len(buf) < 2:
+            return 0.0
+
+        now = buf[-1][0]
+        cutoff = now - window_sec
+        # Find the oldest entry within the window
+        oldest_idx = 0
+        for i, (t, _) in enumerate(buf):
+            if t >= cutoff:
+                oldest_idx = i
+                break
+
+        if oldest_idx >= len(buf) - 1:
+            return 0.0
+
+        oldest_t = buf[oldest_idx][0]
+        oldest_price = buf[oldest_idx][1]
+        newest_price = buf[-1][1]
+        if oldest_price <= 0:
+            return 0.0
+
+        elapsed = now - oldest_t
+        # Need at least 1 second of real elapsed time for meaningful vol
+        if elapsed < 1.0:
+            return 0.0
+
+        # Simple return over the elapsed period, scaled to daily equivalent
+        ret = abs(float((newest_price - oldest_price) / oldest_price))
+        import math
+        daily_scale = math.sqrt(86400.0 / elapsed)
+        return ret * daily_scale
 
     def update_order_book_imbalance(self, obi: float) -> None:
         """Update order book imbalance signal. Range: -1 to +1."""

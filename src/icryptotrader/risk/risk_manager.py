@@ -272,6 +272,24 @@ class RiskManager:
         self._tax_locked = False
         logger.warning("Risk: forced return to ACTIVE_TRADING")
 
+    def record_withdrawal(self, amount_usd: Decimal) -> None:
+        """Adjust HWM down after an external withdrawal (e.g., tax payment).
+
+        Without this, withdrawing 30% to pay the Finanzamt would register
+        as a 30% drawdown and permanently freeze the bot.
+        """
+        if amount_usd <= 0:
+            return
+        old_hwm = self._hwm
+        self._hwm = max(Decimal("0"), self._hwm - amount_usd)
+        self._initial_portfolio = max(
+            Decimal("0"), self._initial_portfolio - amount_usd,
+        )
+        logger.info(
+            "HWM adjusted for withdrawal: %.2f → %.2f (withdrew %.2f USD)",
+            old_hwm, self._hwm, amount_usd,
+        )
+
     @property
     def effective_max_dd_pct(self) -> float:
         """Current effective max drawdown threshold (may be tightened)."""

@@ -60,6 +60,10 @@ class DeltaSkew:
     ) -> SkewResult:
         """Compute buy/sell skew offsets based on allocation deviation.
 
+        Uses convex (quadratic) scaling: skew = sign(dev) * (dev*100)^2 * 0.5
+        This acts like a dial (gradual) instead of a light switch (binary).
+        Small deviations produce minimal skew; large deviations ramp up fast.
+
         Args:
             btc_alloc_pct: Current BTC allocation as fraction (0.0 to 1.0).
             target_pct: Target BTC allocation as fraction.
@@ -79,9 +83,13 @@ class DeltaSkew:
         """
         deviation = btc_alloc_pct - target_pct
 
-        # Convert deviation to bps using sensitivity multiplier
-        # deviation of 0.10 (10%) with sensitivity 2.0 = 20 bps skew
-        raw_skew_bps = Decimal(str(deviation)) * Decimal("100") * self._sensitivity
+        # Convex quadratic scaling: gradual for small deviations, aggressive for large
+        # E.g., 5% deviation → sign(0.05) * (5)^2 * 0.5 = 12.5 bps
+        #        10% deviation → sign(0.10) * (10)^2 * 0.5 = 50 bps (clamped to 30)
+        #        2% deviation → sign(0.02) * (2)^2 * 0.5 = 2 bps
+        dev_bps = deviation * 100  # Convert to percentage points
+        sign = Decimal("1") if deviation >= 0 else Decimal("-1")
+        raw_skew_bps = sign * Decimal(str(dev_bps * dev_bps)) * Decimal("0.5") * self._sensitivity
 
         # Clamp to max
         clamped = max(-self._max_skew_bps, min(self._max_skew_bps, raw_skew_bps))

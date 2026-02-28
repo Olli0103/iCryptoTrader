@@ -51,30 +51,35 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         headroom_pct=cfg.rate_limit.headroom_pct,
     )
 
-    # Grid engine
+    # Grid engine (geometric spacing prevents negative price crashes)
     grid_engine = GridEngine(
         fee_model=fee_model,
         order_size_usd=cfg.grid.order_size_usd,
         min_spacing_bps=cfg.grid.min_spacing_bps,
+        geometric=cfg.grid.geometric_spacing,
     )
 
-    # Order manager
+    # Order manager (amend threshold preserves queue priority)
     order_manager = OrderManager(
         num_slots=(cfg.grid.levels * 2) or 10,
         rate_limiter=rate_limiter,
         pair=cfg.pair,
         pending_timeout_ms=cfg.ws.pending_ack_timeout_ms,
+        amend_threshold_bps=cfg.grid.amend_threshold_bps,
     )
 
     # FIFO ledger
     ledger = FIFOLedger()
 
-    # Tax agent
+    # Tax agent (blow-through mode, vault lock priority, wash sale cooldown)
     tax_agent = TaxAgent(
         ledger=ledger,
         annual_exemption_eur=cfg.tax.annual_exemption_eur,
         near_threshold_days=cfg.tax.near_threshold_days,
         emergency_dd_pct=cfg.tax.emergency_dd_override_pct,
+        blow_through_mode=cfg.tax.blow_through_mode,
+        vault_lock_priority=cfg.tax.vault_lock_priority,
+        wash_sale_cooldown_hours=cfg.tax.harvest_wash_sale_cooldown_hours,
     )
 
     # Risk manager — pass trailing stop config from cfg
@@ -115,7 +120,10 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
             min_pct=cfg.regime.chaos.btc_min_pct,
         ),
     }
-    inventory = InventoryArbiter(limits=regime_limits)
+    inventory = InventoryArbiter(
+        limits=regime_limits,
+        max_rebalance_pct_per_min=cfg.risk.max_rebalance_pct_per_min,
+    )
 
     # Regime router
     regime_router = RegimeRouter()

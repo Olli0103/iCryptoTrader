@@ -30,6 +30,8 @@ class GridConfig:
     post_only: bool = True
     auto_compound: bool = False  # Reinvest profits into order size
     compound_base_usd: Decimal = Decimal("5000")  # Starting portfolio for scaling
+    geometric_spacing: bool = True  # Geometric (safe) vs linear (can go negative)
+    amend_threshold_bps: Decimal = Decimal("3")  # Min price move before amending
 
 
 @dataclass
@@ -41,6 +43,7 @@ class RiskConfig:
     price_velocity_cooldown_sec: int = 30
     trailing_stop_enabled: bool = True  # Dynamic trailing stop
     trailing_stop_tighten_pct: float = 0.02  # Tighten 2% per new HWM
+    max_rebalance_pct_per_min: float = 0.01  # TWAP: max 1% portfolio per minute
 
 
 @dataclass
@@ -53,6 +56,9 @@ class TaxConfig:
     harvest_min_loss_eur: Decimal = Decimal("50")
     harvest_max_per_day: int = 3
     harvest_target_net_eur: Decimal = Decimal("800")
+    blow_through_mode: bool = False  # Skip Freigrenze gating, maximize gross
+    harvest_wash_sale_cooldown_hours: int = 24  # §42 AO safe harbor
+    vault_lock_priority: bool = True  # Prioritize selling >365-day lots
 
 
 @dataclass

@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 # Price/qty comparison epsilon (avoid floating point noise)
 PRICE_EPSILON = Decimal("0.01")  # $0.01 for BTC/USD
 QTY_EPSILON = Decimal("0.00000001")  # 1 satoshi
+# Default amend threshold: only amend if price moved by this many bps.
+# On Kraken, amending price resets queue priority. Micro-amends destroy fill rates.
+DEFAULT_AMEND_THRESHOLD_BPS = Decimal("3")
 
 
 @dataclass
@@ -120,10 +123,12 @@ class OrderManager:
         rate_limiter: RateLimiter | None = None,
         pending_timeout_ms: int = 500,
         pair: str = "XBT/USD",
+        amend_threshold_bps: Decimal = DEFAULT_AMEND_THRESHOLD_BPS,
     ) -> None:
         self._pair = pair
         self._rate_limiter = rate_limiter or RateLimiter()
         self._pending_timeout_sec = pending_timeout_ms / 1000.0
+        self._amend_threshold_bps = amend_threshold_bps
 
         # Order slots: indices 0..num_slots-1
         self._slots = [OrderSlot(slot_id=i) for i in range(num_slots)]
@@ -193,13 +198,22 @@ class OrderManager:
             if desired is None:
                 return Action.CancelOrder(slot.order_id)
 
-            price_changed = abs(slot.price - desired.price) > PRICE_EPSILON
             qty_changed = abs(slot.remaining_qty() - desired.qty) > QTY_EPSILON
             side_changed = slot.side != desired.side
 
             # Side change requires cancel+new (can't amend side)
             if side_changed:
                 return Action.CancelOrder(slot.order_id)
+
+            # Price change threshold: On Kraken, amending price resets queue
+            # priority. Only amend if the price moved significantly (>N bps).
+            # This prevents micro-amends that destroy fill rates.
+            price_diff = abs(slot.price - desired.price)
+            price_changed = price_diff > PRICE_EPSILON
+            if price_changed and slot.price > 0:
+                move_bps = (price_diff / slot.price) * Decimal("10000")
+                if move_bps < self._amend_threshold_bps:
+                    price_changed = False  # Ignore sub-threshold moves
 
             if not price_changed and not qty_changed:
                 return Action.Noop()
