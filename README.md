@@ -1,39 +1,254 @@
 # iCryptoTrader
 
-Tax-optimized spot grid trading bot for **Kraken BTC/USD**, built for German tax law compliance (§23 EStG).
+A Bitcoin trading bot for **Kraken** that automatically buys low and sells high using a grid strategy — while keeping your German taxes as low as legally possible.
 
-Runs a mean-reversion grid strategy on Kraken's WebSocket v2 API, with every buy and sell decision gated by a FIFO tax ledger, a risk manager, and an inventory arbiter. Designed to hold BTC lots for 365+ days whenever possible, selling only tax-free positions unless an emergency drawdown override is triggered.
+> **In plain English:** The bot places a ladder of buy orders below the current BTC price and sell orders above it. When the price dips, it buys. When it bounces back, it sells. Each round-trip earns a small profit. It does this 24/7, and it knows German tax law so it avoids selling BTC that would trigger unnecessary taxes.
+
+---
+
+## How the Grid Works
+
+```
+Sell $500 @ $86,500   ← sell order 3
+Sell $500 @ $86,000   ← sell order 2
+Sell $500 @ $85,500   ← sell order 1
+       ── $85,000 ──  ← current BTC price
+Buy  $500 @ $84,500   ← buy order 1
+Buy  $500 @ $84,000   ← buy order 2
+Buy  $500 @ $83,500   ← buy order 3
+```
+
+When the price drops to $84,500, the bot buys. When it rises back to $85,500, the bot sells. The difference (minus fees) is your profit. The grid automatically re-places orders after each fill, so it keeps working around the clock.
+
+**The twist:** In Germany, if you hold BTC for more than 365 days, the profit from selling it is completely tax-free. This bot tracks every single purchase (called a "lot") and tries to only sell lots that have already passed the 365-day mark. If all your lots are too young, the bot simply waits — unless there's an emergency (like a 20% crash).
+
+---
+
+## Quick Start
+
+### What You Need
+
+- **Python 3.11 or newer** — [Download here](https://www.python.org/downloads/)
+- **A Kraken account** — [Sign up here](https://www.kraken.com/)
+- **Kraken API keys** — Create at [kraken.com/u/security/api](https://www.kraken.com/u/security/api)
+  - Enable permissions: "Create & Modify Orders" + "Query Open Orders & Trades"
+
+### Step 1: Install
+
+```bash
+git clone <repo-url> && cd iCryptoTrader
+pip install -e ".[dev]"
+```
+
+### Step 2: Configure
+
+```bash
+# Interactive setup wizard — walks you through everything
+python -m icryptotrader setup
+```
+
+Or manually edit `config/default.toml` (see [Configuration](#configuration) below).
+
+### Step 3: Start Paper Trading
+
+Start small to make sure everything works before risking real money:
+
+```bash
+# Edit config first: set order_size_usd = "50" and grid.levels = 3
+python -m icryptotrader run
+```
+
+### Step 4: Monitor
+
+- **Telegram alerts** — Get notified on your phone for every buy/sell (see [Telegram setup](#telegram-setup))
+- **Web dashboard** — Open `http://localhost:8080` in your browser (see [Dashboard setup](#dashboard-setup))
+- **Backtest** — Test the strategy on historical data before going live:
+  ```bash
+  python -m icryptotrader backtest --data data/btc_prices.csv
+  ```
+
+### Step 5: Go Live
+
+Once you're comfortable, increase `order_size_usd` and `grid.levels` in the config.
+
+> **Warning:** This is a trading bot that uses real money. Start small, monitor closely, and never invest more than you can afford to lose. Past performance (including backtests) does not guarantee future results.
+
+---
 
 ## Key Features
 
-- **Grid Trading Engine** — Symmetric buy/sell grid with fee-aware spacing auto-calibration
-- **AI Signal Engine** — Multi-provider LLM signals (Gemini, Anthropic, OpenAI) for directional bias alongside the grid
-- **Bollinger Band Spacing** — Volatility-adaptive grid density using rolling Bollinger Bands
-- **VWAP Mid-Price** — Volume-weighted average price from recent trades for stable grid centering
-- **FIFO Tax Ledger** — Per-lot tracking with cost basis in USD and EUR, §23 EStG Haltefrist enforcement
-- **Atomic Ledger Persistence** — Crash-safe writes using temp file + atomic rename + fsync
-- **Tax Agent Veto** — Blocks taxable sells, allows tax-free lots, respects the annual Freigrenze (EUR 1,000)
-- **Tax-Loss Harvesting** — Proactive selling of underwater lots to offset gains and optimize Freigrenze
-- **Annual Tax Report Automation** — Auto-generate Anlage SO (CSV/JSON) at year-end
-- **Delta Skew** — Asymmetric grid spacing based on inventory deviation from target allocation
-- **Risk Manager** — Drawdown classification (Healthy/Warning/Problem/Critical/Emergency), pause state machine, price velocity circuit breaker with hysteresis
-- **Regime Router** — EWMA volatility + momentum-based regime classification (Range-bound, Trending Up/Down, Chaos)
-- **Inventory Arbiter** — Per-regime BTC allocation limits with single-tick rebalance caps
-- **Amend-First Order Manager** — Prefers atomic `amend_order` over cancel+new to preserve queue priority
-- **L2 Order Book Manager** — CRC32 checksum validation against Kraken WS v2 spec to detect stale data
-- **Dead Man's Switch** — `cancel_after` heartbeat automatically cancels all orders if the bot disconnects
-- **Telegram Notifications** — Fill alerts, risk state changes, tax unlock countdowns, daily P&L summaries
-- **ECB Rate Service** — Daily EUR/USD reference rates from the ECB for Finanzamt-accepted tax calculations
-- **Config Validation** — Startup validation catches misconfigured values before trading begins
-- **Structured Metrics** — Prometheus-compatible metrics export (counters, gauges, histograms) via built-in HTTP server
-- **Graceful Shutdown** — SIGTERM/SIGINT handler: cancel all orders, disarm DMS, save ledger, close connections
-- **Startup Reconciliation** — Load ledger, reconnect, reconcile order slots against exchange snapshots, cancel orphans
-- **Dynamic Grid Sizing** — Per-regime `order_size_scale` adjusts order notional (1.0x range-bound, 0.75x trending, 0.5x chaos)
-- **Multi-Pair Diversification** — PairManager with weighted capital allocation, portfolio-level risk aggregation, and cross-pair return correlation tracking
-- **Hedge Manager** — Automatic buy-level reduction during drawdowns to limit delta exposure
-- **Lot Age Viewer** — CLI visualization: per-lot table, ASCII age histogram, tax-free unlock schedule, portfolio summary
+### Trading
+- **Grid Trading Engine** — Automatically places buy and sell orders in a symmetric grid around the current price
+- **Bollinger Band Spacing** — Grid spacing automatically widens when the market is volatile and tightens when it's calm (so you don't get caught in big swings)
+- **AI Signal Engine** — Optionally asks an AI (Gemini, Claude, or GPT) for market direction and adjusts the grid accordingly
+- **Dynamic Grid Sizing** — Order sizes automatically scale down during scary markets and scale up during calm ones
+- **Multi-Pair Support** — Trade multiple pairs (e.g., BTC/USD + BTC/EUR) with weighted capital allocation
 
-## Architecture
+### Risk Protection
+- **Circuit Breaker** — If the price moves more than 3% in 60 seconds, the bot freezes to avoid trading in a crash
+- **Drawdown Protection** — Pauses trading when your portfolio drops 15%, and starts emergency selling at 20%
+- **Hedge Manager** — Automatically reduces buy orders during drawdowns to limit your exposure
+- **Dead Man's Switch** — If the bot disconnects from Kraken, all orders are automatically cancelled (so you're never exposed without the bot watching)
+- **Inventory Limits** — Prevents the bot from going "all-in" on BTC; keeps your allocation balanced
+
+### German Tax Optimization
+- **FIFO Tax Ledger** — Tracks every BTC purchase with exact cost basis in both USD and EUR
+- **365-Day Rule** — Only sells BTC lots older than 365 days (tax-free under German law)
+- **Freigrenze Protection** — Keeps your annual taxable gains below EUR 1,000 (the tax-free threshold)
+- **Tax-Loss Harvesting** — If you're above the Freigrenze, proactively sells losing positions to offset gains
+- **Annual Tax Report** — Auto-generates the Anlage SO form (CSV/JSON) for your tax return
+- **ECB Exchange Rates** — Uses official ECB EUR/USD rates for all tax calculations (accepted by the Finanzamt)
+
+### Operations
+- **Telegram Notifications** — Real-time alerts for fills, risk state changes, tax unlocks, and daily P&L
+- **Web Dashboard** — Browser-based status page with portfolio overview, grid state, and lot ages
+- **Graceful Shutdown** — Press Ctrl+C and the bot safely cancels all orders, saves your ledger, and exits
+- **Crash-Safe Persistence** — Your ledger is saved to disk after every trade using atomic writes (no data loss even if the bot crashes mid-write)
+- **Prometheus Metrics** — Export trading metrics to your monitoring stack
+
+---
+
+## Configuration
+
+All settings live in `config/default.toml`. The setup wizard creates this for you, but here's what each section does:
+
+```toml
+pair = "XBT/USD"                   # Which pair to trade (XBT = BTC on Kraken)
+log_level = "INFO"                 # How much logging ("DEBUG" for troubleshooting)
+persistence_backend = "json"       # How to save the ledger ("json" or "sqlite")
+
+[kraken]
+api_key = ""                       # Your Kraken API key
+api_secret = ""                    # Your Kraken API secret (keep this safe!)
+
+[grid]
+levels = 5                         # How many buy + sell orders to place (5 = 5 buys + 5 sells)
+order_size_usd = "500"             # How much USD per order ($500 = ~0.006 BTC at $85k)
+min_spacing_bps = "20"             # Minimum gap between orders in basis points (20 bps = 0.20%)
+post_only = true                   # Only place maker orders (lower fees)
+
+[risk]
+max_portfolio_drawdown_pct = 0.15  # Pause trading if portfolio drops 15% from peak
+emergency_drawdown_pct = 0.20      # Emergency sell if portfolio drops 20%
+price_velocity_freeze_pct = 0.03   # Freeze if price moves 3% in 60 seconds
+price_velocity_cooldown_sec = 30   # Wait 30 seconds after freeze before resuming
+
+[tax]
+holding_period_days = 365          # Days to hold BTC before it's tax-free (German law: 365)
+near_threshold_days = 330          # Don't sell lots this close to becoming tax-free
+annual_exemption_eur = "1000"      # German Freigrenze (EUR 1,000/year tax-free threshold)
+emergency_dd_override_pct = 0.20   # Override tax protection in a 20% drawdown emergency
+harvest_enabled = false            # Tax-loss harvesting (turn on to optimize taxes)
+harvest_min_loss_eur = "50"        # Only harvest losses bigger than EUR 50
+harvest_max_per_day = 3            # Max harvest trades per day
+harvest_target_net_eur = "800"     # Try to keep taxable gains below EUR 800
+
+[regime.range_bound]               # Settings when the market is calm and sideways
+btc_target_pct = 0.50              # Target 50% of portfolio in BTC
+btc_max_pct = 0.60                 # Never go above 60% BTC
+btc_min_pct = 0.40                 # Never go below 40% BTC
+grid_levels = 5                    # Use all 5 grid levels
+order_size_scale = 1.0             # Full order size
+
+[regime.trending_up]               # Settings when BTC is going up
+order_size_scale = 0.75            # Reduce order size to 75%
+
+[regime.chaos]                     # Settings when the market is crashing
+btc_target_pct = 0.00             # Get out of BTC entirely
+btc_max_pct = 0.05
+grid_levels = 0                    # Don't place any orders
+signal_enabled = false
+order_size_scale = 0.5             # Half order size
+
+[bollinger]
+enabled = true                     # Use Bollinger Bands for adaptive spacing
+window = 20                        # Look at the last 20 price ticks
+multiplier = 2.0                   # Standard Bollinger multiplier
+spacing_scale = 0.5                # How much Bollinger affects spacing
+min_spacing_bps = "15"             # Never go below 15 bps (0.15%)
+max_spacing_bps = "200"            # Never go above 200 bps (2.0%)
+
+[telegram]
+enabled = false                    # Set to true to enable Telegram alerts
+bot_token = ""                     # Get from @BotFather on Telegram
+chat_id = ""                       # Your Telegram chat ID
+
+[ai_signal]
+enabled = false                    # Set to true to enable AI signals
+provider = "gemini"                # "gemini", "anthropic", or "openai"
+api_key = ""                       # API key for your chosen AI provider
+model = "gemini-2.0-flash"         # Which AI model to use
+cooldown_sec = 300                 # Wait 5 minutes between AI queries
+weight = 0.3                       # How much the AI influences trading (0-1)
+timeout_sec = 10                   # Give up if AI doesn't respond in 10s
+
+[metrics]
+enabled = false                    # Prometheus metrics endpoint
+port = 9090
+
+[hedge]
+enabled = false                    # Auto-reduce exposure during drawdowns
+trigger_drawdown_pct = 0.10        # Activate at 10% drawdown
+strategy = "reduce_exposure"       # Reduce buy orders
+max_reduction_pct = 0.50           # Cancel up to 50% of buy levels
+
+[web]
+enabled = false                    # Browser dashboard
+port = 8080
+host = "127.0.0.1"
+username = ""                      # Leave empty for no login required
+password = ""
+
+# Multi-pair allocation (optional — uncomment to trade multiple pairs)
+# [[pairs]]
+# symbol = "XBT/USD"
+# weight = 0.7                    # 70% of capital to BTC/USD
+# [[pairs]]
+# symbol = "XBT/EUR"
+# weight = 0.3                    # 30% of capital to BTC/EUR
+```
+
+### Telegram Setup
+
+1. Open Telegram, search for **@BotFather**, and type `/newbot`
+2. Follow the prompts to create a bot — you'll get a **bot token**
+3. Send any message to your new bot, then visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` to find your **chat_id**
+4. Set both values in `config/default.toml` and set `enabled = true`
+
+### Dashboard Setup
+
+1. Set `web.enabled = true` in `config/default.toml`
+2. Optionally set `username` and `password` for login protection
+3. Open `http://localhost:8080` in your browser after starting the bot
+
+---
+
+## Glossary
+
+| Term | Meaning |
+|------|---------|
+| **bps (basis points)** | 1 bps = 0.01%. So 20 bps = 0.20%. Used to describe tiny price differences. |
+| **Grid** | A ladder of buy and sell orders placed at regular intervals above and below the current price. |
+| **Spacing** | The gap between grid levels. Wider spacing = fewer trades but larger profits per trade. |
+| **FIFO** | "First In, First Out" — when you sell BTC, the oldest purchased lot is sold first (German tax law requires this). |
+| **Lot** | A single BTC purchase with its own cost basis, timestamp, and tax status. |
+| **Haltefrist** | German holding period: 365 days. BTC held longer than this is tax-free when sold. |
+| **Freigrenze** | German tax-free threshold: EUR 1,000/year. If your total crypto gains stay under this, you pay zero tax. |
+| **Drawdown** | How much your portfolio has dropped from its highest point. 15% drawdown = you've lost 15% from the peak. |
+| **Circuit Breaker** | Emergency stop that freezes trading when the price is moving too fast (like in a crash). |
+| **DMS (Dead Man's Switch)** | A safety feature: if the bot stops sending heartbeats to Kraken, all orders are cancelled automatically. |
+| **Regime** | The bot classifies the market into 4 states: Range-bound (sideways), Trending Up, Trending Down, or Chaos. Each regime uses different trading parameters. |
+| **Delta Skew** | When you hold too much BTC, the bot makes sell orders tighter (easier to hit) and buy orders wider (harder to hit) to rebalance. |
+| **Bollinger Bands** | A statistical measure of how volatile the price is. The bot uses this to automatically adjust grid spacing. |
+| **VWAP** | Volume-Weighted Average Price — a more stable "average price" that accounts for trade volume. Used as the grid center. |
+| **Maker / Taker** | Maker = your order sits in the book waiting (lower fees). Taker = your order fills immediately (higher fees). The bot uses maker-only orders. |
+| **Anlage SO** | The section of the German tax return where you report crypto gains/losses. |
+
+---
+
+## Architecture (for Developers)
+
+If you're a developer looking to understand or modify the code, this section is for you.
 
 ```
                   +-----------+
@@ -139,14 +354,14 @@ EMPTY ──add_order──> PENDING_NEW ──ack──> LIVE
 
 - **Haltefrist**: BTC held >365 days is tax-free (steuerfrei)
 - **FIFO**: Oldest lots sold first (per BMF circular 10.05.2022)
-- **Freigrenze**: Annual gains under EUR 1,000 are fully exempt
-- **Near-threshold protection**: Lots 330-365 days old are protected from sale
-- **Emergency override**: Portfolio drawdown >20% overrides all tax locks
+- **Freigrenze**: Annual gains under EUR 1,000 are fully exempt (but if you go even 1 cent over, the entire amount is taxable)
+- **Near-threshold protection**: Lots 330-365 days old are protected from sale (too close to becoming tax-free)
+- **Emergency override**: Portfolio drawdown >20% overrides all tax locks (survival first)
 - **ECB reference rate**: All EUR conversions use the official ECB daily rate
 - **Tax-loss harvesting**: Proactive selling of underwater lots to offset YTD gains, targeting net below Freigrenze
 - **Annual report automation**: Auto-generate Anlage SO CSV/JSON at year-end
 
-## Project Structure
+### Project Structure
 
 ```
 src/icryptotrader/
@@ -211,164 +426,11 @@ config/
 tests/                     # 645 tests across 33 test files
 ```
 
-## Configuration
-
-All settings are defined in `config/default.toml`. Copy and customize:
-
-```toml
-pair = "XBT/USD"
-log_level = "INFO"
-persistence_backend = "json"   # "json" or "sqlite"
-
-[kraken]
-api_key = ""        # Your Kraken API key
-api_secret = ""     # Your Kraken API secret
-
-[grid]
-levels = 5                # Grid levels per side
-order_size_usd = "500"    # Notional per level
-min_spacing_bps = "20"    # Minimum spacing (basis points)
-post_only = true           # Maker-only orders
-
-[risk]
-max_portfolio_drawdown_pct = 0.15    # 15% -> RISK_PAUSE
-emergency_drawdown_pct = 0.20       # 20% -> EMERGENCY_SELL
-price_velocity_freeze_pct = 0.03    # 3% in 60s -> circuit breaker
-price_velocity_cooldown_sec = 30
-
-[tax]
-holding_period_days = 365
-near_threshold_days = 330
-annual_exemption_eur = "1000"
-emergency_dd_override_pct = 0.20
-harvest_enabled = false           # Tax-loss harvesting (opt-in)
-harvest_min_loss_eur = "50"       # Minimum loss to bother harvesting
-harvest_max_per_day = 3           # Max harvest sells per day
-harvest_target_net_eur = "800"    # Target net below Freigrenze
-
-[regime.range_bound]
-btc_target_pct = 0.50
-btc_max_pct = 0.60
-btc_min_pct = 0.40
-grid_levels = 5
-order_size_scale = 1.0     # Full size in range-bound
-
-[regime.trending_up]
-order_size_scale = 0.75    # Reduced in trending
-
-[regime.chaos]
-btc_target_pct = 0.00
-btc_max_pct = 0.05
-grid_levels = 0
-signal_enabled = false
-order_size_scale = 0.5     # Half size in chaos
-
-[ws]
-cancel_after_timeout_sec = 60    # Dead man's switch timeout
-heartbeat_interval_sec = 20     # DMS re-arm interval
-
-[rate_limit]
-max_counter = 180       # Kraken Pro tier
-decay_rate = 3.75       # Counter decay per second
-headroom_pct = 0.80     # Throttle at 80% of max
-
-[bollinger]
-enabled = true
-window = 20                # Rolling price window (ticks)
-multiplier = 2.0           # Band multiplier (k * std_dev)
-spacing_scale = 0.5        # band_width_bps * scale = spacing
-min_spacing_bps = "15"     # Hard floor
-max_spacing_bps = "200"    # Hard cap
-
-[telegram]
-enabled = false
-bot_token = ""
-chat_id = ""
-
-[ai_signal]
-enabled = false
-provider = "gemini"        # "gemini", "anthropic", "openai"
-api_key = ""
-model = "gemini-2.0-flash"
-temperature = 0.2
-max_tokens = 512
-cooldown_sec = 300         # Min seconds between AI calls
-weight = 0.3               # Signal weight vs grid (0.0-1.0)
-timeout_sec = 10
-
-[metrics]
-enabled = false
-port = 9090
-prefix = "icryptotrader"
-
-[hedge]
-enabled = false
-trigger_drawdown_pct = 0.10    # Activate hedge at 10% drawdown
-strategy = "reduce_exposure"   # "reduce_exposure" or "inverse_grid"
-max_reduction_pct = 0.50       # Max portion of buy levels to cancel
-
-[web]
-enabled = false
-port = 8080
-host = "127.0.0.1"
-username = ""                  # Basic auth (leave empty to disable)
-password = ""
-
-# Multi-pair allocation (optional, repeatable section)
-# [[pairs]]
-# symbol = "XBT/USD"
-# weight = 0.7
-# [[pairs]]
-# symbol = "XBT/EUR"
-# weight = 0.3
-```
-
-## Installation
-
-```bash
-# Clone and install
-git clone <repo-url> && cd iCryptoTrader
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Type checking
-mypy src/
-
-# Linting
-ruff check src/ tests/
-```
-
-**Requirements**: Python 3.11+, websockets, orjson, pyzmq, httpx
-
-## Quick Start
-
-```bash
-# 1. Interactive setup — creates config/user.toml with your API keys
-python -m icryptotrader setup
-
-# 2. Run the bot (reads config/default.toml, overridden by config/user.toml)
-python -m icryptotrader run
-
-# 3. Run a backtest on historical price data (CSV: one price per line)
-python -m icryptotrader backtest --prices data/btc_prices.csv
-
-# 4. View CLI help
-python -m icryptotrader --help
-```
-
-### First-Time Checklist
-
-1. **Get Kraken API keys** — Create keys at [kraken.com/u/security/api](https://www.kraken.com/u/security/api) with "Create & Modify Orders" + "Query Open Orders & Trades" permissions
-2. **Run `python -m icryptotrader setup`** — The wizard walks you through API key entry, grid size, risk limits, and optional features (Telegram, AI signals)
-3. **Paper-trade first** — Start with `order_size_usd = "50"` and `grid.levels = 3` to validate behavior before scaling up
-4. **Enable Telegram** — Set `telegram.enabled = true` with your bot token and chat ID for real-time fill alerts and P&L summaries
-5. **Monitor** — Enable the web dashboard (`web.enabled = true`) at `http://localhost:8080` for real-time grid state and lot ages
+---
 
 ## AI Signal Engine
 
-The bot includes a flexible AI signal engine that queries LLM providers for directional bias:
+The bot can optionally ask an AI for market direction. This is **completely optional** — the bot works perfectly without it.
 
 | Provider | Model | Use Case |
 |----------|-------|----------|
@@ -386,18 +448,20 @@ The engine is **fail-open** — if the AI provider is unreachable, the bot conti
 
 ## Fee Model
 
-Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier:
+Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier. You don't need to configure this — it's automatic based on your 30-day trading volume:
 
-| 30-Day Volume (USD) | Maker (bps) | Taker (bps) | Min Profitable Spacing |
-|---------------------|-------------|-------------|----------------------|
-| $0 - $10K           | 25          | 40          | 65 bps               |
-| $10K - $50K         | 20          | 35          | 55 bps               |
-| $50K - $100K        | 14          | 24          | 43 bps               |
-| $100K - $250K       | 12          | 20          | 39 bps               |
-| $1M - $5M           | 4           | 14          | 23 bps               |
-| $10M+               | 0           | 10          | 15 bps               |
+| 30-Day Volume (USD) | Maker Fee | Taker Fee | Min Grid Spacing |
+|---------------------|-----------|-----------|-----------------|
+| $0 - $10K           | 0.25%     | 0.40%     | 0.65%           |
+| $10K - $50K         | 0.20%     | 0.35%     | 0.55%           |
+| $50K - $100K        | 0.14%     | 0.24%     | 0.43%           |
+| $100K - $250K       | 0.12%     | 0.20%     | 0.39%           |
+| $1M - $5M           | 0.04%     | 0.14%     | 0.23%           |
+| $10M+               | 0.00%     | 0.10%     | 0.15%           |
 
-*Min profitable spacing = 2x maker fee + 10 bps adverse selection + 5 bps min edge*
+*The bot ensures every trade is profitable by making the grid spacing at least 2x your maker fee + a safety margin.*
+
+---
 
 ## Testing
 
@@ -405,10 +469,16 @@ Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier
 # Full suite (645 tests)
 pytest -v
 
-# With coverage
+# With coverage report
 pytest --cov=icryptotrader --cov-report=term-missing
 
-# Specific module
+# Type checking (strict mode)
+mypy src/
+
+# Linting
+ruff check src/ tests/
+
+# Specific modules
 pytest tests/test_fifo_ledger.py -v     # FIFO ledger + underwater lots (39 tests)
 pytest tests/test_telegram.py -v        # Interactive Telegram bot (57 tests)
 pytest tests/test_risk_manager.py -v    # Drawdown, pause states, circuit breaker (38 tests)
@@ -428,64 +498,65 @@ pytest tests/test_lifecycle.py -v       # Graceful shutdown + reconciliation (16
 pytest tests/test_pair_manager.py -v    # Multi-pair diversification (16 tests)
 pytest tests/test_tax_report.py -v      # Anlage SO export (16 tests)
 pytest tests/test_lot_viewer.py -v      # Lot age visualization (15 tests)
-pytest tests/test_main.py -v            # CLI entry point (12 tests)
-pytest tests/test_metrics.py -v         # Prometheus metrics (12 tests)
+pytest tests/test_integration_e2e.py -v # End-to-end integration (13 tests)
+pytest tests/test_main.py -v           # CLI entry point (12 tests)
+pytest tests/test_metrics.py -v        # Prometheus metrics (12 tests)
 pytest tests/test_backtest_engine.py -v # Backtest engine (11 tests)
-pytest tests/test_hedge_manager.py -v   # Hedge manager (10 tests)
+pytest tests/test_hedge_manager.py -v  # Hedge manager (10 tests)
 pytest tests/test_strategy_loop_wiring.py -v  # Bollinger, AI, SQLite wiring (16 tests)
-pytest tests/test_integration_e2e.py -v      # End-to-end integration (13 tests)
-pytest tests/test_watchdog.py -v        # Process watchdog (5 tests)
-pytest tests/test_web_dashboard.py -v   # Web dashboard (7 tests)
+pytest tests/test_watchdog.py -v       # Process watchdog (5 tests)
+pytest tests/test_web_dashboard.py -v  # Web dashboard (7 tests)
 ```
 
-**Line coverage: 80%** (4,226 statements, 3,380 covered). Uncovered lines are primarily async WS connection/dispatch code and interactive setup wizard — all business logic paths are thoroughly tested.
+**Line coverage: 80%** (4,226 statements, 3,380 covered). Uncovered lines are primarily async WebSocket connection code and the interactive setup wizard — all business logic paths are thoroughly tested, including 13 end-to-end integration tests exercising the full tick cycle with real components (no mocks).
 
-Test coverage spans all critical paths: FIFO lot accounting, underwater lot identification, tax-loss harvest recommendations, order state transitions, risk pause states, circuit breaker hysteresis, regime classification, VWAP tracking, fee tier resolution, rate limiting, WS codec, grid computation, delta skew, inventory allocation, tax agent veto logic, ECB rates, tax reporting, annual report automation, Bollinger Band spacing, L2 book checksums, Telegram bot (interactive keyboards, polling), graceful shutdown/reconciliation, lot age visualization, AI signal engine (Gemini/Anthropic/OpenAI), config validation, structured metrics, web dashboard, process watchdog, hedge manager, multi-pair diversification, backtest engine, CLI entry point wiring, and **13 end-to-end integration tests** exercising the full tick cycle with all real components (no mocks).
+---
 
 ## Roadmap
 
-### Phase 2 — Production Hardening (Implemented)
+### Phase 2 — Production Hardening (Done)
 
-- [x] **Ledger persistence on fill**: Auto-save FIFO ledger to disk after every fill
-- [x] **Atomic ledger writes**: Crash-safe persistence using temp file + atomic rename + fsync
-- [x] **httpx.AsyncClient reuse**: Shared `httpx.AsyncClient` across WS token requests
-- [x] **Balances channel subscription**: WS2 `balances` channel for real-time BTC/USD balance updates
-- [x] **Telegram notifications**: Fill alerts, risk state changes, daily P&L summaries, tax unlock countdowns
-- [x] **Graceful shutdown**: SIGTERM/SIGINT handler that cancels all orders, disarms DMS, saves ledger, and exits cleanly
-- [x] **Startup reconciliation flow**: On boot, load ledger from disk, connect WS2, reconcile via executions snapshot, cancel orphans, then begin trading
-- [x] **Config validation**: Startup validation catches invalid values (ranges, ordering, required fields)
-- [ ] **Process isolation**: Split into Feed Process (WS1 + ZMQ PUB) and Strategy Process (WS2 + strategy loop) for crash isolation
+- [x] Ledger persistence on fill
+- [x] Atomic ledger writes (crash-safe)
+- [x] httpx.AsyncClient reuse
+- [x] Balances channel subscription
+- [x] Telegram notifications
+- [x] Graceful shutdown (SIGTERM/SIGINT)
+- [x] Startup reconciliation flow
+- [x] Config validation
+- [ ] Process isolation (Feed + Strategy split)
 
-### Phase 3 — Observability & Resilience (Implemented)
+### Phase 3 — Observability & Resilience (Done)
 
-- [x] **Order book checksum validation**: L2 book manager with CRC32 checksum validation per Kraken WS v2 spec
-- [x] **Circuit breaker hysteresis**: Cooldown period with 50% recovery threshold before re-entering trading after velocity freeze
-- [x] **Reconnect state recovery**: LifecycleManager reconciles order slots against exchange snapshots after reconnect, cancels orphan orders
-- [x] **Structured metrics export**: Prometheus-compatible metrics registry (counters, gauges, histograms) with built-in HTTP server
-- [x] **Web dashboard**: Async HTTP server with real-time status API, lot ages, portfolio allocation, optional Basic auth
+- [x] Order book checksum validation (CRC32)
+- [x] Circuit breaker hysteresis
+- [x] Reconnect state recovery
+- [x] Structured metrics export (Prometheus)
+- [x] Web dashboard
 
-### Phase 4 — Strategy Enhancements (Implemented)
+### Phase 4 — Strategy Enhancements (Done)
 
-- [x] **Bollinger Band volatility spacing**: Automatic `spacing_bps` adjustment based on rolling Bollinger Band width with configurable scale, floor, and cap
-- [x] **Dynamic grid sizing**: Per-regime `order_size_scale` adjusts order notional (1.0x range-bound, 0.75x trending, 0.5x chaos), wired through RegimeRouter → StrategyLoop → GridEngine
-- [x] **AI Signal Engine**: Multi-provider LLM signals (Gemini, Anthropic, OpenAI) for directional bias, confidence scoring, and regime hints
-- [x] **Volume-weighted mid-price**: VWAP from recent trades for stable grid centering, integrated into RegimeRouter
-- [ ] **Adaptive regime thresholds**: Self-tuning EWMA/momentum thresholds based on rolling realized vol distributions
-- [x] **Multi-pair support**: PairManager wired into `__main__.py` — weighted capital allocation, portfolio risk aggregation, cross-pair correlation tracking via `[[pairs]]` config
+- [x] Bollinger Band volatility spacing
+- [x] Dynamic grid sizing (per-regime)
+- [x] AI Signal Engine (Gemini, Claude, GPT)
+- [x] Volume-weighted mid-price (VWAP)
+- [x] Multi-pair support (PairManager)
+- [ ] Adaptive regime thresholds
 
-### Phase 5 — Tax Optimization (Implemented)
+### Phase 5 — Tax Optimization (Done)
 
-- [x] **Tax-loss harvesting**: `underwater_lots()` + `recommend_loss_harvest()` with Freigrenze targeting, near-threshold protection, and configurable rate limits
-- [x] **Lot age visualization**: CLI view with per-lot table, ASCII age histogram, projected tax-free unlock schedule, and portfolio summary
-- [x] **Annual report automation**: Auto-generate Anlage SO CSV/JSON via `auto_generate_annual_report()` method
-- [ ] **Multi-year carry-forward**: Track loss carry-forward across tax years for accurate Freigrenze calculations
+- [x] Tax-loss harvesting
+- [x] Lot age visualization
+- [x] Annual report automation (Anlage SO)
+- [ ] Multi-year carry-forward
 
-### Backlog (Low Priority)
+### Backlog
 
-- [ ] Move `DesiredLevel` dataclass from `order_manager.py` to `types.py` to reduce cross-layer coupling
-- [ ] Add `taker_bps` to `FeeTier.rt_cost_bps` as an option for non-post_only scenarios
-- [ ] REST fallback for order placement when WS2 is temporarily disconnected
-- [ ] FIX API support as alternative to WebSocket for lower-latency execution
+- [ ] Process isolation (Feed + Strategy split for crash safety)
+- [ ] REST fallback for order placement
+- [ ] FIX API support for lower latency
+
+---
 
 ## License
 
