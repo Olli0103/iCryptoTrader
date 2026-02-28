@@ -29,6 +29,8 @@ Runs a mean-reversion grid strategy on Kraken's WebSocket v2 API, with every buy
 - **Graceful Shutdown** — SIGTERM/SIGINT handler: cancel all orders, disarm DMS, save ledger, close connections
 - **Startup Reconciliation** — Load ledger, reconnect, reconcile order slots against exchange snapshots, cancel orphans
 - **Dynamic Grid Sizing** — Per-regime `order_size_scale` adjusts order notional (1.0x range-bound, 0.75x trending, 0.5x chaos)
+- **Multi-Pair Diversification** — PairManager with weighted capital allocation, portfolio-level risk aggregation, and cross-pair return correlation tracking
+- **Hedge Manager** — Automatic buy-level reduction during drawdowns to limit delta exposure
 - **Lot Age Viewer** — CLI visualization: per-lot table, ASCII age histogram, tax-free unlock schedule, portfolio summary
 
 ## Architecture
@@ -206,7 +208,7 @@ src/icryptotrader/
 config/
   default.toml             # Default configuration
 
-tests/                     # 621 tests across 32 test files
+tests/                     # 645 tests across 33 test files
 ```
 
 ## Configuration
@@ -400,7 +402,7 @@ Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier
 ## Testing
 
 ```bash
-# Full suite (621 tests)
+# Full suite (645 tests)
 pytest -v
 
 # With coverage
@@ -418,7 +420,7 @@ pytest tests/test_ai_signal.py -v       # AI signal engine — all providers (24
 pytest tests/test_fee_model.py -v       # Fee tiers, profitability gates (24 tests)
 pytest tests/test_bollinger.py -v       # Bollinger Band + ATR spacing (23 tests)
 pytest tests/test_ws_codec.py -v        # WS v2 message codec (23 tests)
-pytest tests/test_config.py -v          # Config validation (21 tests)
+pytest tests/test_config.py -v          # Config validation (26 tests)
 pytest tests/test_regime_router.py -v   # Regime classification + VWAP (20 tests)
 pytest tests/test_grid_engine.py -v     # Grid levels + spacing (19 tests)
 pytest tests/test_backtest.py -v        # Backtest simulation (18 tests)
@@ -430,12 +432,15 @@ pytest tests/test_main.py -v            # CLI entry point (12 tests)
 pytest tests/test_metrics.py -v         # Prometheus metrics (12 tests)
 pytest tests/test_backtest_engine.py -v # Backtest engine (11 tests)
 pytest tests/test_hedge_manager.py -v   # Hedge manager (10 tests)
-pytest tests/test_strategy_loop_wiring.py -v  # Bollinger, AI, SQLite wiring (10 tests)
+pytest tests/test_strategy_loop_wiring.py -v  # Bollinger, AI, SQLite wiring (16 tests)
+pytest tests/test_integration_e2e.py -v      # End-to-end integration (13 tests)
 pytest tests/test_watchdog.py -v        # Process watchdog (5 tests)
 pytest tests/test_web_dashboard.py -v   # Web dashboard (7 tests)
 ```
 
-Test coverage spans all critical paths: FIFO lot accounting, underwater lot identification, tax-loss harvest recommendations, order state transitions, risk pause states, circuit breaker hysteresis, regime classification, VWAP tracking, fee tier resolution, rate limiting, WS codec, grid computation, delta skew, inventory allocation, tax agent veto logic, ECB rates, tax reporting, annual report automation, Bollinger Band spacing, L2 book checksums, Telegram bot (interactive keyboards, polling), graceful shutdown/reconciliation, lot age visualization, AI signal engine (Gemini/Anthropic/OpenAI), config validation, structured metrics, web dashboard, process watchdog, hedge manager, multi-pair diversification, backtest engine, and CLI entry point wiring.
+**Line coverage: 80%** (4,226 statements, 3,380 covered). Uncovered lines are primarily async WS connection/dispatch code and interactive setup wizard — all business logic paths are thoroughly tested.
+
+Test coverage spans all critical paths: FIFO lot accounting, underwater lot identification, tax-loss harvest recommendations, order state transitions, risk pause states, circuit breaker hysteresis, regime classification, VWAP tracking, fee tier resolution, rate limiting, WS codec, grid computation, delta skew, inventory allocation, tax agent veto logic, ECB rates, tax reporting, annual report automation, Bollinger Band spacing, L2 book checksums, Telegram bot (interactive keyboards, polling), graceful shutdown/reconciliation, lot age visualization, AI signal engine (Gemini/Anthropic/OpenAI), config validation, structured metrics, web dashboard, process watchdog, hedge manager, multi-pair diversification, backtest engine, CLI entry point wiring, and **13 end-to-end integration tests** exercising the full tick cycle with all real components (no mocks).
 
 ## Roadmap
 
@@ -466,7 +471,7 @@ Test coverage spans all critical paths: FIFO lot accounting, underwater lot iden
 - [x] **AI Signal Engine**: Multi-provider LLM signals (Gemini, Anthropic, OpenAI) for directional bias, confidence scoring, and regime hints
 - [x] **Volume-weighted mid-price**: VWAP from recent trades for stable grid centering, integrated into RegimeRouter
 - [ ] **Adaptive regime thresholds**: Self-tuning EWMA/momentum thresholds based on rolling realized vol distributions
-- [ ] **Multi-pair support**: Extend `Pair`, `FeeModel`, and slot allocation to trade multiple BTC pairs (e.g., XBT/EUR)
+- [x] **Multi-pair support**: PairManager wired into `__main__.py` — weighted capital allocation, portfolio risk aggregation, cross-pair correlation tracking via `[[pairs]]` config
 
 ### Phase 5 — Tax Optimization (Implemented)
 

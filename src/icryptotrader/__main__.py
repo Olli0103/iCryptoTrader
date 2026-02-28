@@ -172,6 +172,19 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
             max_reduction_pct=cfg.hedge.max_reduction_pct,
         )
 
+    # Pair manager (optional — multi-pair diversification)
+    pair_manager = None
+    if cfg.pairs:
+        from icryptotrader.pair_manager import PairManager
+
+        pair_manager = PairManager(total_capital_usd=cfg.grid.compound_base_usd)
+        for pair_alloc in cfg.pairs:
+            pair_manager.add_pair(pair_alloc.symbol, weight=pair_alloc.weight)
+        pair_manager.allocate()
+        logger.info(
+            "PairManager: %d pairs configured", pair_manager.pair_count,
+        )
+
     # Web dashboard (optional)
     web_dashboard = None
     if cfg.web.enabled:
@@ -251,6 +264,7 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         "ledger": ledger,
         "hedge_manager": hedge_manager,
         "web_dashboard": web_dashboard,
+        "pair_manager": pair_manager,
     }
 
 
@@ -275,6 +289,7 @@ async def _run_bot(cfg: Config) -> None:
     ai_signal = c["ai_signal"]
     hedge_manager = c["hedge_manager"]
     web_dashboard = c["web_dashboard"]
+    pair_manager = c["pair_manager"]
 
     # Lifecycle manager
     lm = LifecycleManager(
@@ -349,6 +364,17 @@ async def _run_bot(cfg: Config) -> None:
                             )
 
                     commands = strategy_loop.tick(mid_price=price)
+
+                    # Update pair manager with current state
+                    if pair_manager:
+                        inv_snap = c["inventory"].snapshot()
+                        pair_manager.update_pair(
+                            symbol=cfg.pair,
+                            current_value_usd=inv_snap.portfolio_value_usd,
+                            drawdown_pct=c["risk_manager"].drawdown_pct,
+                            price=price,
+                        )
+
                     for cmd in commands:
                         params = cmd.get("params", {})
                         cmd_type = cmd.get("type")
