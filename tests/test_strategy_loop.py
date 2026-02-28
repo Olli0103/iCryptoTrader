@@ -390,6 +390,73 @@ class TestMetrics:
         assert loop.commands_issued == len(commands)
 
 
+class TestAutoCompounding:
+    def test_compound_order_size_scales_with_portfolio(self) -> None:
+        """Order size should scale with portfolio growth."""
+        loop = _make_loop()
+        loop._auto_compound = True
+        loop._compound_base_usd = Decimal("5000")
+        loop._base_order_size_usd = Decimal("500")
+        # Simulate portfolio at $10000 (2x growth)
+        loop._inv.update_balances(btc=Decimal("0.06"), usd=Decimal("5000"))
+        loop._inv.update_price(Decimal("85000"))
+        size = loop.compound_order_size()
+        # Scale = 10100/5000 ≈ 2.02, so size ≈ 1010
+        assert size > Decimal("500")
+
+    def test_compound_disabled_returns_base(self) -> None:
+        loop = _make_loop()
+        loop._auto_compound = False
+        loop._base_order_size_usd = Decimal("500")
+        size = loop.compound_order_size()
+        assert size == Decimal("500")
+
+    def test_compound_zero_base_returns_base(self) -> None:
+        loop = _make_loop()
+        loop._auto_compound = True
+        loop._compound_base_usd = Decimal("0")
+        loop._base_order_size_usd = Decimal("500")
+        size = loop.compound_order_size()
+        assert size == Decimal("500")
+
+    def test_compound_zero_portfolio_returns_base(self) -> None:
+        loop = _make_loop(btc=Decimal("0"), usd=Decimal("0"))
+        loop._auto_compound = True
+        loop._compound_base_usd = Decimal("5000")
+        loop._base_order_size_usd = Decimal("500")
+        size = loop.compound_order_size()
+        assert size == Decimal("500")
+
+
+class TestBotSnapshot:
+    def test_snapshot_returns_all_fields(self) -> None:
+        loop = _make_loop()
+        loop.tick(mid_price=Decimal("85000"))
+        snap = loop.bot_snapshot()
+        assert snap.portfolio_value_usd > Decimal("0")
+        assert snap.ticks == 1
+        assert snap.uptime_sec >= 0
+        assert snap.eur_usd_rate == Decimal("1.08")
+
+    def test_snapshot_tracks_fills(self) -> None:
+        loop = _make_loop()
+        from unittest.mock import MagicMock
+
+        slot = MagicMock()
+        slot.side = Side.BUY
+        slot.slot_id = 0
+        loop.on_fill(slot, {
+            "last_qty": "0.01",
+            "last_price": "85000",
+            "fee": "1.00",
+            "order_id": "O1",
+            "trade_id": "T1",
+        })
+        snap = loop.bot_snapshot()
+        assert snap.fills_today == 1
+        assert snap.open_lots == 1
+
+
 class TestLedgerPersistence:
     def test_auto_save_on_buy_fill(self, tmp_path) -> None:
         """Ledger is saved to disk after a buy fill."""

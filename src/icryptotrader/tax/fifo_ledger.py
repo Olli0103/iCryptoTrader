@@ -389,6 +389,72 @@ class FIFOLedger:
         self._lots.sort(key=lambda x: x.purchase_timestamp)
         logger.info("FIFO ledger loaded from %s (%d lots)", path, len(self._lots))
 
+    def save_sqlite(self, path: Path) -> None:
+        """Save ledger to SQLite database (ACID-compliant).
+
+        SQLite provides full ACID guarantees — WAL mode ensures readers
+        never block writers and vice versa. This is safer than JSON
+        for high-frequency write patterns (every fill).
+        """
+        import sqlite3
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS lots (
+                    lot_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            conn.execute("DELETE FROM lots")
+            for lot in self._lots:
+                conn.execute(
+                    "INSERT INTO lots (lot_id, data) VALUES (?, ?)",
+                    (lot.lot_id, json.dumps(_lot_to_dict(lot), default=str)),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                ("lot_count", str(len(self._lots))),
+            )
+            conn.commit()
+            logger.info(
+                "FIFO ledger saved to SQLite %s (%d lots)",
+                path, len(self._lots),
+            )
+        finally:
+            conn.close()
+
+    def load_sqlite(self, path: Path) -> None:
+        """Load ledger from SQLite database."""
+        import sqlite3
+
+        if not path.exists():
+            logger.info("No SQLite ledger at %s, starting fresh", path)
+            return
+        conn = sqlite3.connect(str(path))
+        try:
+            cursor = conn.execute("SELECT data FROM lots")
+            rows = cursor.fetchall()
+            self._lots = [
+                _dict_to_lot(json.loads(row[0])) for row in rows
+            ]
+            self._lots.sort(key=lambda x: x.purchase_timestamp)
+            logger.info(
+                "FIFO ledger loaded from SQLite %s (%d lots)",
+                path, len(self._lots),
+            )
+        finally:
+            conn.close()
+
 
 def _lot_to_dict(lot: TaxLot) -> dict:  # type: ignore[type-arg]
     """Serialize a TaxLot to a JSON-safe dict."""

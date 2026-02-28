@@ -141,3 +141,46 @@ levels = -5
         cfg = Config()
         assert cfg.metrics.enabled is False
         assert cfg.metrics.port == 9090
+
+    def test_grid_auto_compound_defaults(self) -> None:
+        cfg = Config()
+        assert cfg.grid.auto_compound is False
+        assert cfg.grid.compound_base_usd == Decimal("5000")
+
+    def test_bollinger_atr_defaults(self) -> None:
+        cfg = Config()
+        assert cfg.bollinger.atr_enabled is True
+        assert cfg.bollinger.atr_window == 14
+        assert cfg.bollinger.atr_weight == 0.3
+
+    def test_risk_trailing_stop_defaults(self) -> None:
+        cfg = Config()
+        assert cfg.risk.trailing_stop_enabled is True
+        assert cfg.risk.trailing_stop_tighten_pct == 0.02
+
+    def test_toml_loads_new_fields(self) -> None:
+        toml_content = b"""
+[grid]
+auto_compound = true
+compound_base_usd = "10000"
+
+[bollinger]
+atr_enabled = false
+atr_window = 20
+atr_weight = 0.5
+
+[risk]
+trailing_stop_enabled = false
+trailing_stop_tighten_pct = 0.05
+"""
+        with NamedTemporaryFile(suffix=".toml", delete=False) as f:
+            f.write(toml_content)
+            f.flush()
+            cfg = load_config(Path(f.name))
+        assert cfg.grid.auto_compound is True
+        assert cfg.grid.compound_base_usd == Decimal("10000")
+        assert cfg.bollinger.atr_enabled is False
+        assert cfg.bollinger.atr_window == 20
+        assert cfg.bollinger.atr_weight == 0.5
+        assert cfg.risk.trailing_stop_enabled is False
+        assert cfg.risk.trailing_stop_tighten_pct == 0.05

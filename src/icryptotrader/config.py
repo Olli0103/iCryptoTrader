@@ -28,6 +28,8 @@ class GridConfig:
     order_size_usd: Decimal = Decimal("500")
     min_spacing_bps: Decimal = Decimal("20")
     post_only: bool = True
+    auto_compound: bool = False  # Reinvest profits into order size
+    compound_base_usd: Decimal = Decimal("5000")  # Starting portfolio for scaling
 
 
 @dataclass
@@ -37,6 +39,8 @@ class RiskConfig:
     price_velocity_freeze_pct: float = 0.03
     price_velocity_window_sec: int = 60
     price_velocity_cooldown_sec: int = 30
+    trailing_stop_enabled: bool = True  # Dynamic trailing stop
+    trailing_stop_tighten_pct: float = 0.02  # Tighten 2% per new HWM
 
 
 @dataclass
@@ -112,6 +116,9 @@ class BollingerConfig:
     spacing_scale: float = 0.5
     min_spacing_bps: Decimal = Decimal("15")
     max_spacing_bps: Decimal = Decimal("200")
+    atr_enabled: bool = True  # Combine ATR with Bollinger for spacing
+    atr_window: int = 14  # ATR lookback period
+    atr_weight: float = 0.3  # Weight of ATR vs Bollinger (0=BB only, 1=ATR only)
 
 
 @dataclass
