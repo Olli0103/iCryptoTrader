@@ -18,6 +18,8 @@ min_spacing_bps = "20"
 post_only = true
 auto_compound = false
 compound_base_usd = "5000"
+geometric_spacing = true
+amend_threshold_bps = "3"
 
 [risk]
 max_portfolio_drawdown_pct = 0.15
@@ -27,6 +29,7 @@ price_velocity_window_sec = 60
 price_velocity_cooldown_sec = 30
 trailing_stop_enabled = true
 trailing_stop_tighten_pct = 0.02
+max_rebalance_pct_per_min = 0.01  # TWAP: max 1% portfolio per minute
 
 [tax]
 holding_period_days = 365
@@ -37,6 +40,9 @@ harvest_enabled = false
 harvest_min_loss_eur = "50"
 harvest_max_per_day = 3
 harvest_target_net_eur = "800"
+blow_through_mode = false
+harvest_wash_sale_cooldown_hours = 24
+vault_lock_priority = true
 
 [regime.range_bound]
 btc_target_pct = 0.50
@@ -91,6 +97,13 @@ max_spacing_bps = "200"
 atr_enabled = true
 atr_window = 14
 atr_weight = 0.3
+
+[avellaneda_stoikov]
+enabled = false
+gamma = 0.3
+max_spread_bps = "500"
+max_skew_bps = "50"
+obi_sensitivity_bps = "10"
 
 [telegram]
 enabled = false

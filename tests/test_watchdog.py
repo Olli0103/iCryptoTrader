@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
+
+import pytest
 
 from icryptotrader.watchdog import Watchdog
 
@@ -29,27 +32,30 @@ def _make_watchdog(
 
 
 class TestWatchdog:
-    def test_healthy_no_failures(self) -> None:
+    @pytest.mark.asyncio
+    async def test_healthy_no_failures(self) -> None:
         wd = _make_watchdog(ticks=1000, ws_connected=True)
-        wd._check_health()
+        await wd._check_health()
         assert wd.failures == 0
         assert wd.checks == 1
 
-    def test_ws_disconnected_counts_failure(self) -> None:
+    @pytest.mark.asyncio
+    async def test_ws_disconnected_counts_failure(self) -> None:
         wd = _make_watchdog(ws_connected=False)
-        wd._check_health()
+        await wd._check_health()
         assert wd.failures == 1
         assert wd._consecutive_failures == 1
 
-    def test_recovery_resets_counter(self) -> None:
+    @pytest.mark.asyncio
+    async def test_recovery_resets_counter(self) -> None:
         wd = _make_watchdog(ws_connected=False)
-        wd._check_health()  # fail
+        await wd._check_health()  # fail
         assert wd._consecutive_failures == 1
 
         # Fix the issue
         wd._ws.is_connected = True
         wd._strategy.ticks = 1000
-        wd._check_health()  # recover
+        await wd._check_health()  # recover
         assert wd._consecutive_failures == 0
         assert wd.recoveries == 1
 
@@ -64,3 +70,20 @@ class TestWatchdog:
         assert wd.checks == 0
         assert wd.failures == 0
         assert wd.recoveries == 0
+
+    @pytest.mark.asyncio
+    async def test_graceful_shutdown_on_max_failures(self) -> None:
+        """After max_failures, watchdog triggers graceful shutdown."""
+        lm = MagicMock()
+        lm.shutdown = MagicMock(return_value=asyncio.Future())
+        lm.shutdown.return_value.set_result(None)
+
+        wd = _make_watchdog(ws_connected=False)
+        wd._lm = lm
+
+        for _ in range(3):
+            await wd._check_health()
+
+        assert wd._consecutive_failures == 3
+        assert not wd._running
+        lm.shutdown.assert_called_once()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum, auto
@@ -97,8 +98,8 @@ class RiskManager:
         self._pause_state = PauseState.ACTIVE_TRADING
         self._tax_locked = False
 
-        # Price velocity circuit breaker
-        self._price_history: list[tuple[float, Decimal]] = []
+        # Price velocity circuit breaker — deque avoids O(n) list rebuild on prune
+        self._price_history: deque[tuple[float, Decimal]] = deque()
         self._velocity_frozen = False
         self._velocity_unfreeze_at: float = 0.0
 
@@ -227,11 +228,10 @@ class RiskManager:
         # Record price
         self._price_history.append((now, price))
 
-        # Prune old entries
+        # Prune old entries from the left (deque is ordered by time)
         cutoff = now - self._velocity_window_sec
-        self._price_history = [
-            (t, p) for t, p in self._price_history if t >= cutoff
-        ]
+        while self._price_history and self._price_history[0][0] < cutoff:
+            self._price_history.popleft()
 
         if len(self._price_history) < 2:
             return False

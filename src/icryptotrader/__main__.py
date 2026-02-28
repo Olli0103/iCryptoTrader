@@ -66,6 +66,7 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         pair=cfg.pair,
         pending_timeout_ms=cfg.ws.pending_ack_timeout_ms,
         amend_threshold_bps=cfg.grid.amend_threshold_bps,
+        post_only=cfg.grid.post_only,
     )
 
     # FIFO ledger
@@ -211,6 +212,8 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         from icryptotrader.web.dashboard import WebDashboard
 
         web_dashboard = WebDashboard(
+            risk_manager=risk_manager,
+            metrics_registry=metrics_registry,
             host=cfg.web.host,
             port=cfg.web.port,
             username=cfg.web.username,
@@ -248,6 +251,9 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         book=order_book,
         avellaneda_stoikov=as_model,
     )
+
+    # P0-1: Wire fill callback so FIFO ledger is updated on every fill
+    order_manager.on_fill(strategy_loop.on_fill)
 
     # Telegram bot (optional)
     telegram_bot = None
@@ -344,10 +350,11 @@ async def _run_bot(cfg: Config) -> None:
         await web_dashboard.start()
         logger.info("Web dashboard started on %s:%d", cfg.web.host, cfg.web.port)
 
-    # Watchdog
+    # P1-4: Watchdog — pass lifecycle manager for graceful shutdown
     watchdog = Watchdog(
         strategy_loop=strategy_loop,
         ws_private=ws_private,
+        lifecycle_manager=lm,
     )
     watchdog_task = asyncio.create_task(watchdog.run())
 
@@ -364,10 +371,11 @@ async def _run_bot(cfg: Config) -> None:
     tick_event = asyncio.Event()
     order_book = c["order_book"]
 
+    # P2: Move import to module scope for the closure
+    from icryptotrader.ws.ws_codec import MessageType, WSMessage
+
     def _on_book_msg(msg: object) -> None:
         """Route book channel data to OrderBook and signal tick."""
-        from icryptotrader.ws.ws_codec import WSMessage
-
         assert isinstance(msg, WSMessage)
         if not msg.data:
             return
@@ -382,17 +390,42 @@ async def _run_bot(cfg: Config) -> None:
         """Signal tick on public trade."""
         tick_event.set()
 
-    def _on_execution_msg(_msg: object) -> None:
-        """Signal tick on private execution (fill, order status)."""
+    def _on_execution_msg(msg: object) -> None:
+        """Route execution events to OrderManager and signal tick."""
+        assert isinstance(msg, WSMessage)
+        for exec_data in msg.data:
+            order_manager.on_execution_event(exec_data)
         tick_event.set()
+
+    def _on_ack_msg(msg: object) -> None:
+        """Route command ack responses to OrderManager."""
+        assert isinstance(msg, WSMessage)
+        req_id = msg.req_id or 0
+        order_id = msg.result.get("order_id", "")
+        success = msg.success or False
+        error = msg.error or ""
+
+        if msg.msg_type == MessageType.ADD_ORDER_RESP:
+            order_manager.on_add_order_ack(req_id, order_id, success, error)
+        elif msg.msg_type == MessageType.AMEND_ORDER_RESP:
+            order_manager.on_amend_order_ack(order_id, success, error)
+        elif msg.msg_type == MessageType.CANCEL_ORDER_RESP:
+            order_manager.on_cancel_ack(order_id, success, error)
 
     # Register WS callbacks that drive the event loop
     ws_public.on_channel("book", _on_book_msg)
     ws_public.on_channel("trade", _on_trade_msg)
+    # P0-2: Wire execution and ack events from ws_private to OrderManager
     ws_private.on_execution(_on_execution_msg)
+    ws_private.on_ack(_on_ack_msg)
 
     # Subscribe to L2 book channel for OBI and validated mid-price
     ws_public.subscribe("book", symbol=[cfg.pair], depth=10)
+
+    # P1-1: ECB rate service — periodically fetch EUR/USD rate
+    ecb_task = asyncio.create_task(
+        _ecb_rate_loop(strategy_loop),
+    )
 
     # AI signal background loop
     ai_task = None
@@ -400,6 +433,15 @@ async def _run_bot(cfg: Config) -> None:
         ai_task = asyncio.create_task(
             _ai_signal_loop(ai_signal, strategy_loop),
         )
+
+    # P1-2: Wire BotActionProvider for Telegram interactive actions
+    if telegram_bot:
+        action_provider = _BotActionProviderImpl(
+            risk_manager=c["risk_manager"],
+            tax_agent=strategy_loop._tax,
+            strategy_loop=strategy_loop,
+        )
+        telegram_bot.set_action_provider(action_provider)
 
     logger.info("Bot running (event-driven). Press Ctrl+C to stop.")
 
@@ -414,7 +456,7 @@ async def _run_bot(cfg: Config) -> None:
             try:
                 price = c["inventory"].btc_price
                 if price > 0:
-                    # Evaluate hedge before tick
+                    # P0-3: Evaluate hedge before tick and pass action to strategy loop
                     if hedge_manager:
                         risk_mgr = c["risk_manager"]
                         regime_decision = strategy_loop._regime.classify()
@@ -426,11 +468,9 @@ async def _run_bot(cfg: Config) -> None:
                             btc_allocation_pct=inv_snap.btc_allocation_pct,
                             target_allocation_pct=0.5,
                         )
-                        if hedge_action.active and hedge_action.buy_level_cap is not None:
-                            strategy_loop._grid._levels = min(
-                                strategy_loop._grid._levels,
-                                hedge_action.buy_level_cap,
-                            )
+                        strategy_loop.set_hedge_action(hedge_action)
+                    else:
+                        strategy_loop.set_hedge_action(None)
 
                     commands = strategy_loop.tick(mid_price=price)
 
@@ -462,6 +502,7 @@ async def _run_bot(cfg: Config) -> None:
     logger.info("Shutting down...")
     watchdog.stop()
 
+    ecb_task.cancel()
     if ai_task:
         ai_task.cancel()
     if web_dashboard:
@@ -491,20 +532,120 @@ async def _ai_signal_loop(
     """Background loop that periodically refreshes AI signals."""
     from icryptotrader.strategy.ai_signal import AISignalEngine
     from icryptotrader.strategy.strategy_loop import StrategyLoop
+    from icryptotrader.types import Regime
 
     assert isinstance(ai_signal, AISignalEngine)
     assert isinstance(strategy_loop, StrategyLoop)
+
+    hint_map = {
+        "range_bound": Regime.RANGE_BOUND,
+        "trending_up": Regime.TRENDING_UP,
+        "trending_down": Regime.TRENDING_DOWN,
+        "chaos": Regime.CHAOS,
+    }
 
     while True:
         try:
             if ai_signal.is_ready:
                 ctx = strategy_loop.build_ai_context()
-                await ai_signal.generate_signal(ctx)
+                signal = await ai_signal.generate_signal(ctx)
+                # P1-6: Consume AI regime_hint
+                if signal and signal.regime_hint:
+                    hint_regime = hint_map.get(signal.regime_hint.lower())
+                    if hint_regime is not None and signal.confidence >= 0.5:
+                        strategy_loop._regime.override_regime(
+                            hint_regime, f"ai_signal({signal.confidence:.0%})",
+                        )
         except asyncio.CancelledError:
             break
         except Exception:
             logger.exception("AI signal loop error")
         await asyncio.sleep(10)
+
+
+async def _ecb_rate_loop(strategy_loop: object) -> None:
+    """Background loop that periodically fetches ECB EUR/USD rate.
+
+    Runs every 4 hours. Uses synchronous httpx in an executor to avoid
+    blocking the event loop.
+    """
+    import functools
+    from datetime import date as date_type
+
+    from icryptotrader.strategy.strategy_loop import StrategyLoop
+    from icryptotrader.tax.ecb_rates import ECBRateService
+
+    assert isinstance(strategy_loop, StrategyLoop)
+
+    # Initial delay to let WS connections settle
+    await asyncio.sleep(5)
+
+    service = ECBRateService()
+    loop = asyncio.get_event_loop()
+
+    while True:
+        try:
+            today = date_type.today()
+            rate = await loop.run_in_executor(
+                None, functools.partial(service.get_rate, today),
+            )
+            strategy_loop.set_eur_usd_rate(rate)
+            logger.info("ECB EUR/USD rate updated: %s", rate)
+        except asyncio.CancelledError:
+            service.close()
+            break
+        except Exception:
+            logger.warning("ECB rate fetch failed, keeping previous rate", exc_info=True)
+        await asyncio.sleep(4 * 3600)  # Refresh every 4 hours
+
+
+class _BotActionProviderImpl:
+    """Concrete BotActionProvider wiring Telegram actions to bot components."""
+
+    def __init__(
+        self,
+        risk_manager: object,
+        tax_agent: object,
+        strategy_loop: object,
+    ) -> None:
+        from icryptotrader.risk.risk_manager import RiskManager
+        from icryptotrader.strategy.strategy_loop import StrategyLoop
+        from icryptotrader.tax.tax_agent import TaxAgent
+
+        assert isinstance(risk_manager, RiskManager)
+        assert isinstance(tax_agent, TaxAgent)
+        assert isinstance(strategy_loop, StrategyLoop)
+
+        self._risk = risk_manager
+        self._tax = tax_agent
+        self._strategy = strategy_loop
+
+    async def action_pause_trading(self) -> str:
+        self._risk.force_risk_pause()
+        return "Trading paused (RISK_PAUSE_ACTIVE)"
+
+    async def action_resume_trading(self) -> str:
+        self._risk.force_active()
+        return "Trading resumed (ACTIVE_TRADING)"
+
+    async def action_trigger_harvest(self) -> str:
+        recs = self._tax.recommend_loss_harvest(
+            current_price_usd=self._strategy._inv.btc_price,
+            eur_usd_rate=self._strategy._eur_usd_rate,
+        )
+        if not recs:
+            return "No harvest candidates found"
+        return f"Found {len(recs)} harvest candidates (manual review required)"
+
+    async def action_reset_risk(self) -> str:
+        self._risk.force_active()
+        return "Risk state reset to ACTIVE_TRADING"
+
+    async def action_toggle_blow_through(self) -> str:
+        current = self._tax._blow_through_mode
+        self._tax._blow_through_mode = not current
+        state = "ON" if not current else "OFF"
+        return f"Blow-through mode: {state}"
 
 
 # ---------------------------------------------------------------------------

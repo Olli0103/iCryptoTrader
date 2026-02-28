@@ -124,8 +124,10 @@ class OrderManager:
         pending_timeout_ms: int = 500,
         pair: str = "XBT/USD",
         amend_threshold_bps: Decimal = DEFAULT_AMEND_THRESHOLD_BPS,
+        post_only: bool = True,
     ) -> None:
         self._pair = pair
+        self._post_only = post_only
         self._rate_limiter = rate_limiter or RateLimiter()
         self._pending_timeout_sec = pending_timeout_ms / 1000.0
         self._amend_threshold_bps = amend_threshold_bps
@@ -265,7 +267,7 @@ class OrderManager:
             "price": str(action.price),
             "quantity": str(action.qty),
             "cl_ord_id": cl_ord_id,
-            "post_only": True,
+            "post_only": self._post_only,
             "req_id": req_id,
         }
 
