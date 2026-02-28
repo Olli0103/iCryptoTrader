@@ -39,7 +39,9 @@ if TYPE_CHECKING:
     from icryptotrader.metrics import MetricsRegistry
     from icryptotrader.notify.telegram import BotSnapshot
     from icryptotrader.strategy.ai_signal import AISignalEngine
+    from icryptotrader.strategy.avellaneda_stoikov import AvellanedaStoikov
     from icryptotrader.strategy.bollinger import BollingerSpacing
+    from icryptotrader.ws.book_manager import OrderBook
 
 from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
@@ -99,6 +101,8 @@ class StrategyLoop:
         bollinger: BollingerSpacing | None = None,
         ai_signal: AISignalEngine | None = None,
         persistence_backend: str = "json",
+        book: OrderBook | None = None,
+        avellaneda_stoikov: AvellanedaStoikov | None = None,
     ) -> None:
         self._fee = fee_model
         self._om = order_manager
@@ -121,6 +125,12 @@ class StrategyLoop:
 
         # Persistence backend
         self._persistence_backend = persistence_backend
+
+        # L2 order book (for OBI and validated mid-price)
+        self._book = book
+
+        # Avellaneda-Stoikov optimal spacing model
+        self._as = avellaneda_stoikov
 
         # Auto-compounding
         self._auto_compound = auto_compound
@@ -246,23 +256,47 @@ class StrategyLoop:
         if rec_sell >= 0:
             num_sell = min(num_sell, rec_sell)
 
-        # 7. Compute delta skew
+        # 7. Compute delta skew (with OBI from book if available)
         limits = self._inv.current_limits()
+        obi = 0.0
+        if self._book is not None and self._book.is_valid:
+            obi = self._book.order_book_imbalance()
+            self._regime.update_order_book_imbalance(obi)
         skew_result = self._skew.compute(
             btc_alloc_pct=snap.btc_allocation_pct,
             target_pct=limits.target_pct,
+            obi=obi,
         )
 
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
-        # Use Bollinger+ATR dynamic spacing if available, else fee-model static
-        base_spacing = self._grid.optimal_spacing_bps()
-        if self._bollinger is not None:
-            self._price_window.append(mid_price)
-            high = max(self._price_window)
-            low = min(self._price_window)
-            bb_state = self._bollinger.update(mid_price, high=high, low=low)
-            if bb_state is not None:
-                base_spacing = bb_state.suggested_spacing_bps
+        fee_floor = self._grid.optimal_spacing_bps()
+
+        # Avellaneda-Stoikov: when enabled, computes optimal spread and
+        # inventory skew in one model, replacing Bollinger + DeltaSkew.
+        if self._as is not None:
+            inv_delta = snap.btc_allocation_pct - limits.target_pct
+            as_result = self._as.compute(
+                volatility_bps=Decimal(str(self._regime.ewma_volatility * 10000)),
+                inventory_delta=Decimal(str(inv_delta)),
+                fee_floor_bps=fee_floor,
+                obi=obi,
+            )
+            base_spacing = as_result.buy_spacing_bps
+            buy_spacing = as_result.buy_spacing_bps
+            sell_spacing = as_result.sell_spacing_bps
+        else:
+            # Fallback: Bollinger+ATR dynamic spacing + DeltaSkew
+            base_spacing = fee_floor
+            if self._bollinger is not None:
+                self._price_window.append(mid_price)
+                high = max(self._price_window)
+                low = min(self._price_window)
+                bb_state = self._bollinger.update(mid_price, high=high, low=low)
+                if bb_state is not None:
+                    base_spacing = bb_state.suggested_spacing_bps
+            buy_spacing, sell_spacing = self._skew.apply_to_spacing(
+                base_spacing, skew_result,
+            )
 
         # Apply AI signal bias to spacing
         ai_bias_bps = Decimal("0")
@@ -272,11 +306,6 @@ class StrategyLoop:
                 ai_bias_bps = sig.suggested_bias_bps * Decimal(
                     str(sig.confidence * self._ai_signal.weight),
                 )
-
-        buy_spacing, sell_spacing = self._skew.apply_to_spacing(
-            base_spacing, skew_result,
-        )
-        # AI bias: positive = bullish → tighter buys, wider sells
         if ai_bias_bps != 0:
             buy_spacing = max(Decimal("5"), buy_spacing - ai_bias_bps)
             sell_spacing = max(Decimal("5"), sell_spacing + ai_bias_bps)
@@ -423,7 +452,9 @@ class StrategyLoop:
             "drawdown_pct": self._risk.drawdown_pct * 100,
             "price_change_1h_pct": 0.0,
             "price_change_24h_pct": 0.0,
-            "book_imbalance": 0.0,
+            "book_imbalance": self._book.order_book_imbalance()
+            if self._book and self._book.is_valid
+            else 0.0,
             "ytd_taxable_gain_eur": float(self._ledger.taxable_gain_ytd()),
         }
 

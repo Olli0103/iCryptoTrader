@@ -128,6 +128,17 @@ class BollingerConfig:
 
 
 @dataclass
+class AvellanedaStoikovConfig:
+    """Configuration for the Avellaneda-Stoikov optimal market making model."""
+
+    enabled: bool = False  # Opt-in; when enabled replaces Bollinger + DeltaSkew
+    gamma: float = 0.3  # Risk aversion [0.01, 2.0]. Higher = wider spread
+    max_spread_bps: Decimal = Decimal("500")
+    max_skew_bps: Decimal = Decimal("50")
+    obi_sensitivity_bps: Decimal = Decimal("10")
+
+
+@dataclass
 class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
@@ -202,6 +213,7 @@ class Config:
     ws: WSConfig = field(default_factory=WSConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     bollinger: BollingerConfig = field(default_factory=BollingerConfig)
+    avellaneda_stoikov: AvellanedaStoikovConfig = field(default_factory=AvellanedaStoikovConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     ai_signal: AISignalConfig = field(default_factory=AISignalConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
@@ -278,6 +290,10 @@ def validate_config(cfg: Config) -> list[str]:
             errors.append(f"regime.{name}: btc_target_pct must be <= btc_max_pct")
         if not (0 < alloc.order_size_scale <= 5.0):
             errors.append(f"regime.{name}: order_size_scale must be in (0, 5.0]")
+
+    # Avellaneda-Stoikov
+    if cfg.avellaneda_stoikov.enabled and cfg.avellaneda_stoikov.gamma <= 0:
+        errors.append("avellaneda_stoikov.gamma must be > 0")
 
     # Bollinger
     if cfg.bollinger.window < 2:
