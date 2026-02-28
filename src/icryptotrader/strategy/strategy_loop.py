@@ -391,13 +391,17 @@ class StrategyLoop:
 
             # Check allocation before issuing buys
             if level is not None and level.side == Side.BUY:
-                allowed = self._inv.check_buy(level.qty)
-                if allowed <= 0:
+                # §42 AO: block buys during wash sale cooldown after harvest
+                if self._tax.is_buy_blocked_by_wash_sale():
                     level = None
-                elif allowed < level.qty:
-                    level = DesiredLevel(
-                        price=level.price, qty=allowed, side=Side.BUY,
-                    )
+                else:
+                    allowed = self._inv.check_buy(level.qty)
+                    if allowed <= 0:
+                        level = None
+                    elif allowed < level.qty:
+                        level = DesiredLevel(
+                            price=level.price, qty=allowed, side=Side.BUY,
+                        )
 
             # Check allocation before issuing sells
             if level is not None and level.side == Side.SELL:

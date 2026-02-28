@@ -57,6 +57,7 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         order_size_usd=cfg.grid.order_size_usd,
         min_spacing_bps=cfg.grid.min_spacing_bps,
         geometric=cfg.grid.geometric_spacing,
+        price_tick_size=cfg.grid.price_tick_size,
     )
 
     # Order manager (amend threshold preserves queue priority)
@@ -67,6 +68,7 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         pending_timeout_ms=cfg.ws.pending_ack_timeout_ms,
         amend_threshold_bps=cfg.grid.amend_threshold_bps,
         post_only=cfg.grid.post_only,
+        price_epsilon=cfg.grid.price_tick_size,
     )
 
     # FIFO ledger
@@ -95,8 +97,11 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         trailing_stop_tighten_pct=cfg.risk.trailing_stop_tighten_pct,
     )
 
-    # Delta skew
-    delta_skew = DeltaSkew()
+    # Delta skew (OBI sensitivity from A-S config when available)
+    delta_skew = DeltaSkew(
+        max_skew_bps=cfg.avellaneda_stoikov.max_skew_bps,
+        obi_sensitivity_bps=cfg.avellaneda_stoikov.obi_sensitivity_bps,
+    )
 
     # Inventory arbiter — build limits from regime config
     regime_limits = {

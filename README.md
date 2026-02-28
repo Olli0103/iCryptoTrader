@@ -129,6 +129,8 @@ levels = 5                         # How many buy + sell orders to place (5 = 5 
 order_size_usd = "500"             # How much USD per order ($500 = ~0.006 BTC at $85k)
 min_spacing_bps = "20"             # Minimum gap between orders in basis points (20 bps = 0.20%)
 post_only = true                   # Only place maker orders (lower fees)
+amend_threshold_bps = "10"         # Min bps move before amending (preserves queue priority)
+price_tick_size = "0.1"            # BTC/USD = 0.1, ETH/USD = 0.01, XRP/USD = 0.0001
 
 [risk]
 max_portfolio_drawdown_pct = 0.15  # Pause trading if portfolio drops 15% from peak
@@ -141,6 +143,7 @@ holding_period_days = 365          # Days to hold BTC before it's tax-free (Germ
 near_threshold_days = 330          # Don't sell lots this close to becoming tax-free
 annual_exemption_eur = "1000"      # German Freigrenze (EUR 1,000/year tax-free threshold)
 emergency_dd_override_pct = 0.20   # Override tax protection in a 20% drawdown emergency
+blow_through_mode = true            # Maximize gross profit (skip Freigrenze gating)
 harvest_enabled = false            # Tax-loss harvesting (turn on to optimize taxes)
 harvest_min_loss_eur = "50"        # Only harvest losses bigger than EUR 50
 harvest_max_per_day = 3            # Max harvest trades per day
@@ -435,7 +438,7 @@ src/icryptotrader/
 config/
   default.toml             # Default configuration
 
-tests/                     # 759 tests across 35 test files
+tests/                     # 775 tests across 35 test files
 ```
 
 ---
@@ -478,7 +481,7 @@ Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier
 ## Testing
 
 ```bash
-# Full suite (759 tests)
+# Full suite (775 tests)
 pytest -v
 
 # With coverage report
@@ -493,18 +496,18 @@ ruff check src/ tests/
 # Specific modules
 pytest tests/test_fifo_ledger.py -v     # FIFO ledger + underwater lots (39 tests)
 pytest tests/test_telegram.py -v        # Interactive Telegram bot (57 tests)
-pytest tests/test_risk_manager.py -v    # Drawdown, pause states, circuit breaker (38 tests)
-pytest tests/test_order_manager.py -v   # Slot states, amend-first logic (33 tests)
+pytest tests/test_risk_manager.py -v    # Drawdown, pause states, circuit breaker (43 tests)
+pytest tests/test_order_manager.py -v   # Slot states, amend-first logic (36 tests)
 pytest tests/test_book_manager.py -v    # L2 book + CRC32 checksums (29 tests)
-pytest tests/test_tax_agent.py -v       # Tax veto + harvest recommendations (25 tests)
+pytest tests/test_tax_agent.py -v       # Tax veto + harvest recommendations (29 tests)
 pytest tests/test_strategy_loop.py -v   # Tick cycle, order dispatch (25 tests)
 pytest tests/test_ai_signal.py -v       # AI signal engine — all providers (24 tests)
 pytest tests/test_fee_model.py -v       # Fee tiers, profitability gates (24 tests)
 pytest tests/test_bollinger.py -v       # Bollinger Band + ATR spacing (23 tests)
 pytest tests/test_ws_codec.py -v        # WS v2 message codec (23 tests)
 pytest tests/test_config.py -v          # Config validation (26 tests)
-pytest tests/test_regime_router.py -v   # Regime classification + VWAP (20 tests)
-pytest tests/test_grid_engine.py -v     # Grid levels + spacing (19 tests)
+pytest tests/test_regime_router.py -v   # Regime classification + VWAP (21 tests)
+pytest tests/test_grid_engine.py -v     # Grid levels + spacing (22 tests)
 pytest tests/test_backtest.py -v        # Backtest simulation (18 tests)
 pytest tests/test_lifecycle.py -v       # Graceful shutdown + reconciliation (16 tests)
 pytest tests/test_pair_manager.py -v    # Multi-pair diversification (16 tests)
@@ -516,13 +519,13 @@ pytest tests/test_metrics.py -v        # Prometheus metrics (12 tests)
 pytest tests/test_backtest_engine.py -v # Backtest engine (11 tests)
 pytest tests/test_hedge_manager.py -v  # Hedge manager (10 tests)
 pytest tests/test_strategy_loop_wiring.py -v  # Bollinger, AI, SQLite wiring (16 tests)
-pytest tests/test_delta_skew.py -v     # Delta skew + OBI integration (14 tests)
+pytest tests/test_delta_skew.py -v     # Delta skew + OBI integration (17 tests)
 pytest tests/test_avellaneda_stoikov.py -v  # A-S optimal market making (19 tests)
 pytest tests/test_watchdog.py -v       # Process watchdog (6 tests)
 pytest tests/test_web_dashboard.py -v  # Web dashboard (7 tests)
 ```
 
-**759 tests**, all business logic paths thoroughly tested, including 13 end-to-end integration tests exercising the full tick cycle with real components (no mocks). Uncovered lines are primarily async WebSocket connection code and the interactive setup wizard.
+**775 tests**, all business logic paths thoroughly tested, including 13 end-to-end integration tests exercising the full tick cycle with real components (no mocks). Uncovered lines are primarily async WebSocket connection code and the interactive setup wizard.
 
 ---
 

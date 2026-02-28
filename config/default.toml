@@ -19,7 +19,8 @@ post_only = true
 auto_compound = false
 compound_base_usd = "5000"
 geometric_spacing = true
-amend_threshold_bps = "3"
+amend_threshold_bps = "10"
+price_tick_size = "0.1"          # BTC/USD = 0.1, ETH/USD = 0.01, XRP/USD = 0.0001
 
 [risk]
 max_portfolio_drawdown_pct = 0.15
@@ -40,7 +41,7 @@ harvest_enabled = false
 harvest_min_loss_eur = "50"
 harvest_max_per_day = 3
 harvest_target_net_eur = "800"
-blow_through_mode = false
+blow_through_mode = true           # Skip Freigrenze gating, maximize gross profit
 harvest_wash_sale_cooldown_hours = 24
 vault_lock_priority = true
 

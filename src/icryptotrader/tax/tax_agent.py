@@ -68,7 +68,11 @@ class TaxAgent:
         self._blow_through_mode = blow_through_mode
         self._vault_lock_priority = vault_lock_priority
         self._wash_sale_cooldown_hours = wash_sale_cooldown_hours
-        # Track last harvest timestamps per lot for wash sale compliance
+        # Buy-side cooldown: blocks all buys after a harvest sell to prevent
+        # immediately recreating economic exposure (§42 AO compliance).
+        # Stored as a Unix timestamp (time.time()) until which buys are blocked.
+        self._buy_cooldown_until: float = 0.0
+        # Also track per-harvest for logging/auditing
         self._harvest_timestamps: dict[str, float] = {}
 
     def evaluate_sell(
@@ -247,17 +251,43 @@ class TaxAgent:
         return self._ledger.days_until_next_free()
 
     def record_harvest(self, lot_id: str) -> None:
-        """Record that a lot was harvested. Starts the wash sale cooldown."""
+        """Record that a lot was harvested. Starts the buy-side cooldown.
+
+        After a tax-loss harvest sell, the grid must NOT buy back the same
+        asset for ``wash_sale_cooldown_hours`` (default 24h). This prevents
+        the Finanzamt from nullifying the loss under §42 AO
+        (Gestaltungsmissbrauch): selling at a loss and immediately rebuying
+        to maintain economic exposure while claiming the tax deduction.
+
+        The cooldown blocks ALL buys (not just the specific lot), because
+        the lot has been sold and no longer exists in the ledger.
+        """
         import time as _time
-        self._harvest_timestamps[lot_id] = _time.time()
+        now = _time.time()
+        self._harvest_timestamps[lot_id] = now
+        cooldown_sec = self._wash_sale_cooldown_hours * 3600.0
+        self._buy_cooldown_until = max(self._buy_cooldown_until, now + cooldown_sec)
+        logger.info(
+            "Wash sale buy-cooldown set: buys blocked for %dh (lot %s harvested)",
+            self._wash_sale_cooldown_hours, lot_id[:8],
+        )
+
+    def is_buy_blocked_by_wash_sale(self) -> bool:
+        """True if buys are currently blocked due to a recent harvest sell.
+
+        The strategy loop should check this before allowing any buy orders.
+        This is the PRIMARY wash sale guard: it prevents the grid from
+        immediately recreating the position that was sold for a tax loss.
+        """
+        import time as _time
+        return _time.time() < self._buy_cooldown_until
 
     def is_wash_sale_safe(self, lot_id: str) -> bool:
         """Check if enough time has passed since last harvest for this lot.
 
-        §42 AO (Gestaltungsmissbrauch): selling and immediately rebuying
-        the same asset to realize a loss is nullifiable. We enforce a
-        configurable cooldown (default 24h) before the same lot's BTC
-        can be repurchased.
+        Used internally by ``recommend_loss_harvest()`` to avoid
+        re-recommending a harvest for the same lot_id if it somehow
+        reappears (e.g., partial fill edge case).
         """
         import time as _time
         last_harvest = self._harvest_timestamps.get(lot_id)
@@ -332,7 +362,7 @@ class TaxAgent:
                 cost_basis_per_btc_eur=lot.cost_basis_per_btc_eur,
                 days_held=lot.days_held,
                 reason="offset_gains" if ytd_gain > self._annual_exemption_eur
-                       else "freigrenze_optimization",
+                       else "loss_offset",
             ))
             cumulative_loss += estimated_loss
 
