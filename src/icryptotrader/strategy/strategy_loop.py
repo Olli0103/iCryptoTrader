@@ -2,14 +2,16 @@
 
 Ties together all components in the Strategy Process:
   - Market data ingestion (from WS1 via ZMQ or direct)
-  - Regime classification → allocation limits
-  - Grid computation → desired levels
-  - Tax agent veto → sell-level gating
-  - Delta skew → asymmetric spacing
-  - Order manager → amend/add/cancel decisions
+  - Regime classification -> allocation limits
+  - Grid computation -> desired levels
+  - Tax agent veto -> sell-level gating
+  - Delta skew -> asymmetric spacing
+  - Order manager -> amend/add/cancel decisions
   - WS2 command dispatch
-  - Fill handling → FIFO ledger updates
-  - Risk monitoring → pause state management
+  - Fill handling -> FIFO ledger updates
+  - Risk monitoring -> pause state management
+  - Auto-compounding -> reinvest profits into order sizing
+  - Telegram + Metrics wiring -> real-time observability
 
 This is the orchestrator — it owns the tick loop and coordinates
 all subsystems. Each tick:
@@ -18,8 +20,9 @@ all subsystems. Each tick:
   3. Classify regime
   4. Compute grid levels
   5. Apply tax agent gating and delta skew
-  6. Run order manager decide_action() per slot
-  7. Dispatch commands to WS2
+  6. Auto-compound order sizing
+  7. Run order manager decide_action() per slot
+  8. Dispatch commands to WS2
 """
 
 from __future__ import annotations
@@ -31,6 +34,9 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from icryptotrader.metrics import MetricsRegistry
+    from icryptotrader.notify.telegram import BotSnapshot
 
 from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
@@ -83,6 +89,10 @@ class StrategyLoop:
         ledger: FIFOLedger,
         eur_usd_rate: Decimal = Decimal("1.08"),
         ledger_path: Path | None = None,
+        auto_compound: bool = False,
+        compound_base_usd: Decimal = Decimal("5000"),
+        base_order_size_usd: Decimal = Decimal("500"),
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self._fee = fee_model
         self._om = order_manager
@@ -95,6 +105,12 @@ class StrategyLoop:
         self._ledger = ledger
         self._eur_usd_rate = eur_usd_rate
         self._ledger_path = ledger_path
+        self._metrics = metrics
+
+        # Auto-compounding
+        self._auto_compound = auto_compound
+        self._compound_base_usd = compound_base_usd
+        self._base_order_size_usd = base_order_size_usd
 
         # Metrics
         self.ticks: int = 0
@@ -102,6 +118,9 @@ class StrategyLoop:
         self.ticks_skipped_risk: int = 0
         self.ticks_skipped_velocity: int = 0
         self.last_tick_duration_ms: float = 0.0
+        self.fills_today: int = 0
+        self.profit_today_usd: Decimal = Decimal("0")
+        self._start_time = time.time()
 
     def set_eur_usd_rate(self, rate: Decimal) -> None:
         """Update EUR/USD rate from ECB service."""
@@ -116,6 +135,23 @@ class StrategyLoop:
         """Save FIFO ledger to disk (called automatically after fills)."""
         if self._ledger_path:
             self._ledger.save(self._ledger_path)
+
+    def compound_order_size(self) -> Decimal:
+        """Compute current order size with auto-compounding.
+
+        Scales order_size_usd proportionally to portfolio growth
+        above compound_base_usd. E.g., if portfolio doubled from
+        $5000 to $10000, order size doubles from $500 to $1000.
+        """
+        if not self._auto_compound or self._compound_base_usd <= 0:
+            return self._base_order_size_usd
+
+        portfolio = self._inv.portfolio_value_usd
+        if portfolio <= 0:
+            return self._base_order_size_usd
+
+        scale = portfolio / self._compound_base_usd
+        return self._base_order_size_usd * scale
 
     def tick(self, mid_price: Decimal) -> list[dict[str, Any]]:
         """Run one strategy tick. Returns list of commands to dispatch.
@@ -137,6 +173,7 @@ class StrategyLoop:
         if self._risk.check_price_velocity(mid_price):
             self.ticks_skipped_velocity += 1
             self.last_tick_duration_ms = (time.monotonic() - tick_start) * 1000
+            self._record_tick_metrics()
             return commands
 
         # 3. Update risk manager
@@ -152,6 +189,7 @@ class StrategyLoop:
         if not self._risk.is_trading_allowed:
             self.ticks_skipped_risk += 1
             self.last_tick_duration_ms = (time.monotonic() - tick_start) * 1000
+            self._record_tick_metrics()
             return commands
 
         # 5. Classify regime
@@ -159,7 +197,9 @@ class StrategyLoop:
 
         # Apply risk manager regime override if suggested
         if risk_snap.suggested_regime is not None:
-            self._regime.override_regime(risk_snap.suggested_regime, "risk_manager")
+            self._regime.override_regime(
+                risk_snap.suggested_regime, "risk_manager",
+            )
             regime_decision = self._regime.classify()
 
         self._inv.set_regime(regime_decision.regime)
@@ -187,8 +227,17 @@ class StrategyLoop:
 
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
         base_spacing = self._grid.optimal_spacing_bps()
-        buy_spacing, sell_spacing = self._skew.apply_to_spacing(base_spacing, skew_result)
+        buy_spacing, sell_spacing = self._skew.apply_to_spacing(
+            base_spacing, skew_result,
+        )
+
+        # Auto-compound: scale order size with portfolio growth
         size_scale = Decimal(str(regime_decision.order_size_scale))
+        if self._auto_compound:
+            compound_size = self.compound_order_size()
+            if compound_size != self._base_order_size_usd:
+                compound_factor = compound_size / self._base_order_size_usd
+                size_scale = size_scale * compound_factor
 
         self._grid.compute_grid(
             mid_price=mid_price,
@@ -221,7 +270,9 @@ class StrategyLoop:
                 if allowed <= 0:
                     level = None
                 elif allowed < level.qty:
-                    level = DesiredLevel(price=level.price, qty=allowed, side=Side.BUY)
+                    level = DesiredLevel(
+                        price=level.price, qty=allowed, side=Side.BUY,
+                    )
 
             # Check allocation before issuing sells
             if level is not None and level.side == Side.SELL:
@@ -229,7 +280,9 @@ class StrategyLoop:
                 if allowed <= 0:
                     level = None
                 elif allowed < level.qty:
-                    level = DesiredLevel(price=level.price, qty=allowed, side=Side.SELL)
+                    level = DesiredLevel(
+                        price=level.price, qty=allowed, side=Side.SELL,
+                    )
 
             action = self._om.decide_action(slot, level)
             cmd = self._dispatch_action(slot, action, i)
@@ -246,6 +299,7 @@ class StrategyLoop:
 
         self.commands_issued += len(commands)
         self.last_tick_duration_ms = (time.monotonic() - tick_start) * 1000
+        self._record_tick_metrics()
         return commands
 
     def on_fill(self, slot: Any, fill_data: dict[str, Any]) -> None:
@@ -260,6 +314,8 @@ class StrategyLoop:
         order_id = fill_data.get("order_id", "")
         trade_id = fill_data.get("trade_id", "")
 
+        self.fills_today += 1
+
         if side == Side.BUY:
             self._ledger.add_lot(
                 quantity_btc=fill_qty,
@@ -273,7 +329,7 @@ class StrategyLoop:
             )
         elif side == Side.SELL:
             try:
-                self._ledger.sell_fifo(
+                disposals = self._ledger.sell_fifo(
                     quantity_btc=fill_qty,
                     sale_price_usd=fill_price,
                     sale_fee_usd=fee_usd,
@@ -281,16 +337,84 @@ class StrategyLoop:
                     exchange_order_id=order_id,
                     exchange_trade_id=trade_id,
                 )
+                # Track P&L from disposals
+                for d in disposals:
+                    self.profit_today_usd += d.gain_loss_eur * self._eur_usd_rate
             except ValueError:
                 logger.exception(
-                    "FIFO sell failed — ledger mismatch, triggering risk pause. "
-                    "fill_qty=%s fill_price=%s order_id=%s",
+                    "FIFO sell failed — ledger mismatch, triggering risk "
+                    "pause. fill_qty=%s fill_price=%s order_id=%s",
                     fill_qty, fill_price, order_id,
                 )
                 self._risk.force_risk_pause()
 
+        # Record fill in metrics
+        if self._metrics:
+            side_label = side.value if side else "unknown"
+            self._metrics.counter_inc(
+                "fills_total", labels={"side": side_label},
+            )
+
         # Persist ledger to disk after every fill
         self.save_ledger()
+
+    def bot_snapshot(self) -> BotSnapshot:
+        """Provide a snapshot for the Telegram bot (BotDataProvider).
+
+        This implements the BotDataProvider protocol so the strategy
+        loop can be directly set as the Telegram bot's data provider.
+        """
+        from icryptotrader.notify.telegram import BotSnapshot
+
+        snap = self._inv.snapshot()
+        return BotSnapshot(
+            portfolio_value_usd=snap.portfolio_value_usd,
+            btc_balance=snap.btc_balance,
+            usd_balance=snap.usd_balance,
+            btc_allocation_pct=snap.btc_allocation_pct,
+            drawdown_pct=self._risk.drawdown_pct,
+            pause_state=self._risk.pause_state.name,
+            high_water_mark_usd=self._risk.high_water_mark,
+            regime=self._regime.current_regime.value
+            if hasattr(self._regime, "current_regime")
+            else snap.regime.value,
+            active_orders=sum(
+                1 for s in self._om.slots
+                if hasattr(s, "state") and s.state.name == "LIVE"
+            ),
+            grid_levels=self._grid._num_levels
+            if hasattr(self._grid, "_num_levels")
+            else 0,
+            ticks=self.ticks,
+            commands_issued=self.commands_issued,
+            last_tick_ms=self.last_tick_duration_ms,
+            uptime_sec=time.time() - self._start_time,
+            ytd_taxable_gain_eur=self._ledger.taxable_gain_ytd(),
+            tax_free_btc=self._ledger.tax_free_btc(),
+            locked_btc=self._ledger.locked_btc(),
+            sellable_ratio=self._ledger.sellable_ratio(),
+            days_until_unlock=self._ledger.days_until_next_free(),
+            open_lots=len(self._ledger.open_lots()),
+            fills_today=self.fills_today,
+            profit_today_usd=self.profit_today_usd,
+            eur_usd_rate=self._eur_usd_rate,
+        )
+
+    def _record_tick_metrics(self) -> None:
+        """Push tick metrics to the metrics registry."""
+        if not self._metrics:
+            return
+        self._metrics.histogram_observe(
+            "tick_latency_ms", self.last_tick_duration_ms,
+        )
+        self._metrics.gauge_set("ticks_total", float(self.ticks))
+        self._metrics.gauge_set(
+            "drawdown_pct", self._risk.drawdown_pct,
+        )
+        self._metrics.gauge_set(
+            "pause_state",
+            float(self._risk.pause_state.value),
+        )
 
     def _dispatch_action(
         self, slot: Any, action: Any, slot_index: int,
@@ -304,16 +428,22 @@ class StrategyLoop:
             if self._om._rate_limiter.should_throttle("add_order"):
                 return None
             params = self._om.prepare_add(slot, action)
-            return {"type": "add", "slot_id": slot_index, "params": params}
+            return {
+                "type": "add", "slot_id": slot_index, "params": params,
+            }
 
         if isinstance(action, Action.AmendOrder):
             if self._om._rate_limiter.should_throttle("amend_order"):
                 return None
             params = self._om.prepare_amend(slot, action)
-            return {"type": "amend", "slot_id": slot_index, "params": params}
+            return {
+                "type": "amend", "slot_id": slot_index, "params": params,
+            }
 
         if isinstance(action, Action.CancelOrder):
             params = self._om.prepare_cancel(slot, action)
-            return {"type": "cancel", "slot_id": slot_index, "params": params}
+            return {
+                "type": "cancel", "slot_id": slot_index, "params": params,
+            }
 
         return None  # Noop

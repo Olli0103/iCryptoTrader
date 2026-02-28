@@ -15,6 +15,8 @@ levels = 5
 order_size_usd = "500"
 min_spacing_bps = "20"
 post_only = true
+auto_compound = false
+compound_base_usd = "5000"
 
 [risk]
 max_portfolio_drawdown_pct = 0.15
@@ -22,6 +24,8 @@ emergency_drawdown_pct = 0.20
 price_velocity_freeze_pct = 0.03
 price_velocity_window_sec = 60
 price_velocity_cooldown_sec = 30
+trailing_stop_enabled = true
+trailing_stop_tighten_pct = 0.02
 
 [tax]
 holding_period_days = 365
@@ -83,6 +87,9 @@ multiplier = 2.0
 spacing_scale = 0.5
 min_spacing_bps = "15"
 max_spacing_bps = "200"
+atr_enabled = true
+atr_window = 14
+atr_weight = 0.3
 
 [telegram]
 enabled = false

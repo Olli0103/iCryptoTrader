@@ -362,6 +362,90 @@ class TestPersistence:
         assert len(ledger.lots) == 0
 
 
+class TestSQLitePersistence:
+    def test_sqlite_save_and_load_roundtrip(self, tmp_path: Path) -> None:
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("2.13"), eur_usd_rate=EUR_USD,
+            purchase_timestamp=_ts(100), source_engine="grid", grid_level=2,
+        )
+        ledger.sell_fifo(
+            quantity_btc=Decimal("0.005"), sale_price_usd=Decimal("90000"),
+            sale_fee_usd=Decimal("1.13"), eur_usd_rate=EUR_USD,
+        )
+
+        filepath = tmp_path / "ledger.db"
+        ledger.save_sqlite(filepath)
+        assert filepath.exists()
+
+        ledger2 = FIFOLedger()
+        ledger2.load_sqlite(filepath)
+
+        assert len(ledger2.lots) == 1
+        lot = ledger2.lots[0]
+        assert lot.quantity_btc == Decimal("0.01")
+        assert lot.remaining_qty_btc == Decimal("0.005")
+        assert lot.status == LotStatus.PARTIALLY_SOLD
+        assert lot.source_engine == "grid"
+        assert lot.grid_level == 2
+        assert len(lot.disposals) == 1
+        assert lot.disposals[0].quantity_btc == Decimal("0.005")
+
+    def test_sqlite_load_nonexistent(self, tmp_path: Path) -> None:
+        ledger = FIFOLedger()
+        ledger.load_sqlite(tmp_path / "does_not_exist.db")
+        assert len(ledger.lots) == 0
+
+    def test_sqlite_overwrite(self, tmp_path: Path) -> None:
+        """Saving twice should overwrite, not append."""
+        filepath = tmp_path / "ledger.db"
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        )
+        ledger.save_sqlite(filepath)
+
+        ledger2 = FIFOLedger()
+        ledger2.add_lot(
+            quantity_btc=Decimal("0.02"), purchase_price_usd=Decimal("90000"),
+            purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+        )
+        ledger2.save_sqlite(filepath)
+
+        ledger3 = FIFOLedger()
+        ledger3.load_sqlite(filepath)
+        assert len(ledger3.lots) == 1
+        assert ledger3.lots[0].quantity_btc == Decimal("0.02")
+
+    def test_sqlite_empty_ledger(self, tmp_path: Path) -> None:
+        filepath = tmp_path / "ledger.db"
+        ledger = FIFOLedger()
+        ledger.save_sqlite(filepath)
+
+        ledger2 = FIFOLedger()
+        ledger2.load_sqlite(filepath)
+        assert len(ledger2.lots) == 0
+
+    def test_sqlite_multiple_lots(self, tmp_path: Path) -> None:
+        filepath = tmp_path / "ledger.db"
+        ledger = FIFOLedger()
+        for i in range(5):
+            ledger.add_lot(
+                quantity_btc=Decimal("0.01"), purchase_price_usd=Decimal("85000"),
+                purchase_fee_usd=Decimal("0"), eur_usd_rate=EUR_USD,
+                purchase_timestamp=_ts(100 - i * 10),
+            )
+        ledger.save_sqlite(filepath)
+
+        ledger2 = FIFOLedger()
+        ledger2.load_sqlite(filepath)
+        assert len(ledger2.lots) == 5
+        for i in range(len(ledger2.lots) - 1):
+            assert ledger2.lots[i].purchase_timestamp <= ledger2.lots[i + 1].purchase_timestamp
+
+
 class TestUnderwaterLots:
     """Tests for underwater_lots() used in tax-loss harvesting."""
 

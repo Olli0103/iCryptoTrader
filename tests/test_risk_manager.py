@@ -210,3 +210,113 @@ class TestMetrics:
         rm = RiskManager(initial_portfolio_usd=Decimal("10000"))
         rm.update_portfolio(Decimal("2500"), Decimal("5500"))
         assert rm.emergency_overrides == 1
+
+
+class TestTrailingDrawdownStop:
+    """Tests for dynamic trailing stop threshold tightening."""
+
+    def test_initial_thresholds_match_base(self) -> None:
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("10000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=True,
+        )
+        assert rm.effective_max_dd_pct == 0.15
+        assert rm.effective_emergency_dd_pct == 0.20
+
+    def test_thresholds_tighten_on_portfolio_growth(self) -> None:
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("10000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=True,
+            trailing_stop_tighten_pct=0.02,
+        )
+        # Portfolio doubles: growth = 100%, tighten = 100% * 0.02 = 0.02
+        rm.update_portfolio(Decimal("15000"), Decimal("5000"))
+        assert rm.effective_max_dd_pct < 0.15
+        assert rm.effective_emergency_dd_pct < 0.20
+
+    def test_thresholds_never_below_floor(self) -> None:
+        """Thresholds should never tighten below 50% of base."""
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("10000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=True,
+            trailing_stop_tighten_pct=0.10,  # Very aggressive tightening
+        )
+        # Portfolio grows 10x: growth = 900%, tighten = 900% * 0.10 = 0.90
+        rm.update_portfolio(Decimal("90000"), Decimal("10000"))
+        # Floor is 50% of base: 0.075 and 0.10
+        assert rm.effective_max_dd_pct >= 0.15 * 0.5
+        assert rm.effective_emergency_dd_pct >= 0.20 * 0.5
+
+    def test_emergency_never_below_max(self) -> None:
+        """Emergency threshold should always be >= max threshold."""
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("10000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=True,
+            trailing_stop_tighten_pct=0.05,
+        )
+        rm.update_portfolio(Decimal("15000"), Decimal("5000"))
+        assert rm.effective_emergency_dd_pct >= rm.effective_max_dd_pct
+
+    def test_disabled_trailing_no_tightening(self) -> None:
+        """When trailing is disabled, thresholds should not change."""
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("10000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=False,
+        )
+        rm.update_portfolio(Decimal("15000"), Decimal("5000"))
+        assert rm.effective_max_dd_pct == 0.15
+        assert rm.effective_emergency_dd_pct == 0.20
+
+    def test_no_tightening_without_growth(self) -> None:
+        """No tightening when portfolio hasn't grown."""
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("10000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=True,
+            trailing_stop_tighten_pct=0.02,
+        )
+        # Portfolio at same level
+        rm.update_portfolio(Decimal("5000"), Decimal("5000"))
+        assert rm.effective_max_dd_pct == 0.15
+        assert rm.effective_emergency_dd_pct == 0.20
+
+    def test_progressive_tightening(self) -> None:
+        """Thresholds should tighten progressively as portfolio grows."""
+        rm = RiskManager(
+            initial_portfolio_usd=Decimal("10000"),
+            max_drawdown_pct=0.15,
+            emergency_drawdown_pct=0.20,
+            trailing_stop_enabled=True,
+            trailing_stop_tighten_pct=0.02,
+        )
+        # Growth 1: 20% growth
+        rm.update_portfolio(Decimal("7000"), Decimal("5000"))
+        dd1 = rm.effective_max_dd_pct
+        # Growth 2: 50% growth
+        rm.update_portfolio(Decimal("10000"), Decimal("5000"))
+        dd2 = rm.effective_max_dd_pct
+        assert dd2 < dd1  # More growth = tighter threshold
+
+    def test_velocity_hysteresis(self) -> None:
+        """Price velocity should use hysteresis for unfreezing."""
+        rm = RiskManager(
+            price_velocity_freeze_pct=0.03,
+            price_velocity_window_sec=60,
+            price_velocity_cooldown_sec=0,  # Instant cooldown
+        )
+        rm.check_price_velocity(Decimal("85000"))
+        # Trigger freeze with 4% move
+        assert rm.check_price_velocity(Decimal("81500")) is True
+        # After cooldown, check hysteresis — still volatile
+        # The unfreeze check looks at current velocity vs 50% threshold

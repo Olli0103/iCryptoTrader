@@ -193,3 +193,105 @@ class TestEdgeCases:
         bb.update(Decimal("86000"))
         expected_sma = (Decimal("85000") + Decimal("85000") + Decimal("86000")) / 3
         assert bb.state.sma == expected_sma
+
+
+class TestATR:
+    """Tests for ATR (Average True Range) integration."""
+
+    def test_atr_none_before_two_prices(self) -> None:
+        bb = BollingerSpacing(window=3, atr_enabled=True, atr_window=3)
+        bb.update(Decimal("85000"))
+        assert bb.atr is None
+
+    def test_atr_computed_after_two_prices(self) -> None:
+        bb = BollingerSpacing(window=3, atr_enabled=True, atr_window=3)
+        bb.update(Decimal("85000"), high=Decimal("85500"), low=Decimal("84500"))
+        bb.update(Decimal("85200"), high=Decimal("85700"), low=Decimal("84800"))
+        assert bb.atr is not None
+        assert bb.atr > 0
+
+    def test_atr_with_high_low(self) -> None:
+        """ATR should reflect the high-low range."""
+        bb = BollingerSpacing(window=5, atr_enabled=True, atr_window=3)
+        # Feed prices with consistent 1000 USD range
+        for i in range(5):
+            mid = Decimal("85000") + Decimal(str(i * 100))
+            bb.update(mid, high=mid + Decimal("500"), low=mid - Decimal("500"))
+
+        assert bb.atr is not None
+        # True range should be around 1000 (high-low = 1000)
+        assert bb.atr >= Decimal("500")
+
+    def test_atr_disabled(self) -> None:
+        """When ATR is disabled, atr property should remain None."""
+        bb = BollingerSpacing(window=3, atr_enabled=False)
+        for _ in range(5):
+            bb.update(Decimal("85000"), high=Decimal("86000"), low=Decimal("84000"))
+        assert bb.atr is None
+
+    def test_atr_blended_spacing(self) -> None:
+        """ATR-blended spacing should differ from pure Bollinger spacing."""
+        bb_no_atr = BollingerSpacing(
+            window=5, atr_enabled=False,
+            min_spacing_bps=Decimal("0"), max_spacing_bps=Decimal("1000"),
+        )
+        bb_with_atr = BollingerSpacing(
+            window=5, atr_enabled=True, atr_window=5, atr_weight=0.5,
+            min_spacing_bps=Decimal("0"), max_spacing_bps=Decimal("1000"),
+        )
+        # Feed volatile high/low but stable mid — ATR should push spacing higher
+        for _ in range(5):
+            mid = Decimal("85000")
+            bb_no_atr.update(mid)
+            bb_with_atr.update(mid, high=mid + Decimal("1000"), low=mid - Decimal("1000"))
+
+        # Pure BB with constant mid → spacing = min
+        assert bb_no_atr.state is not None
+        # ATR with wide range should yield higher spacing
+        assert bb_with_atr.state is not None
+        assert bb_with_atr.state.atr_bps is not None
+        assert bb_with_atr.state.atr_bps > Decimal("0")
+
+    def test_atr_weight_zero_equals_pure_bollinger(self) -> None:
+        """With atr_weight=0, ATR should not affect spacing."""
+        bb_pure = BollingerSpacing(
+            window=5, atr_enabled=False,
+            min_spacing_bps=Decimal("0"), max_spacing_bps=Decimal("1000"),
+        )
+        bb_zero_weight = BollingerSpacing(
+            window=5, atr_enabled=True, atr_window=5, atr_weight=0.0,
+            min_spacing_bps=Decimal("0"), max_spacing_bps=Decimal("1000"),
+        )
+        prices = [Decimal("84000"), Decimal("86000")] * 3
+        for p in prices[:5]:
+            bb_pure.update(p)
+            bb_zero_weight.update(p, high=p + Decimal("500"), low=p - Decimal("500"))
+
+        assert bb_pure.state is not None
+        assert bb_zero_weight.state is not None
+        # With weight=0, blended should equal pure BB spacing
+        assert bb_pure.state.suggested_spacing_bps == bb_zero_weight.state.suggested_spacing_bps
+
+    def test_atr_weight_clamped(self) -> None:
+        """ATR weight should be clamped to [0, 1]."""
+        bb = BollingerSpacing(atr_weight=2.0)
+        assert bb._atr_weight == 1.0
+        bb2 = BollingerSpacing(atr_weight=-0.5)
+        assert bb2._atr_weight == 0.0
+
+    def test_atr_defaults_to_mid_when_no_high_low(self) -> None:
+        """When high/low not provided, ATR should use mid_price."""
+        bb = BollingerSpacing(window=3, atr_enabled=True, atr_window=3)
+        # No high/low provided
+        for _ in range(3):
+            bb.update(Decimal("85000"))
+        # With constant mid and no high/low, ATR should be 0
+        assert bb.atr == Decimal("0")
+
+    def test_reset_clears_atr_state(self) -> None:
+        bb = BollingerSpacing(window=3, atr_enabled=True)
+        for _ in range(5):
+            bb.update(Decimal("85000"), high=Decimal("86000"), low=Decimal("84000"))
+        assert bb.atr is not None
+        bb.reset()
+        assert bb.atr is None

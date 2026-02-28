@@ -70,8 +70,12 @@ class RiskManager:
         price_velocity_freeze_pct: float = 0.03,
         price_velocity_window_sec: int = 60,
         price_velocity_cooldown_sec: int = 30,
+        trailing_stop_enabled: bool = True,
+        trailing_stop_tighten_pct: float = 0.02,
     ) -> None:
+        self._base_max_dd_pct = max_drawdown_pct
         self._max_dd_pct = max_drawdown_pct
+        self._base_emergency_dd_pct = emergency_drawdown_pct
         self._emergency_dd_pct = emergency_drawdown_pct
         self._warning_dd_pct = warning_drawdown_pct
         self._problem_dd_pct = problem_drawdown_pct
@@ -79,6 +83,11 @@ class RiskManager:
         self._velocity_freeze_pct = price_velocity_freeze_pct
         self._velocity_window_sec = price_velocity_window_sec
         self._velocity_cooldown_sec = price_velocity_cooldown_sec
+
+        # Trailing stop — tightens thresholds as portfolio grows
+        self._trailing_enabled = trailing_stop_enabled
+        self._trailing_tighten_pct = trailing_stop_tighten_pct
+        self._initial_portfolio = initial_portfolio_usd
 
         # Portfolio tracking
         self._hwm = initial_portfolio_usd
@@ -148,6 +157,7 @@ class RiskManager:
 
         if total > self._hwm:
             self._hwm = total
+            self._update_trailing_thresholds()
 
         dd_pct = self.drawdown_pct
         dd_level = self._classify_drawdown(dd_pct)
@@ -261,6 +271,50 @@ class RiskManager:
         self._pause_state = PauseState.ACTIVE_TRADING
         self._tax_locked = False
         logger.warning("Risk: forced return to ACTIVE_TRADING")
+
+    @property
+    def effective_max_dd_pct(self) -> float:
+        """Current effective max drawdown threshold (may be tightened)."""
+        return self._max_dd_pct
+
+    @property
+    def effective_emergency_dd_pct(self) -> float:
+        """Current effective emergency drawdown threshold."""
+        return self._emergency_dd_pct
+
+    def _update_trailing_thresholds(self) -> None:
+        """Tighten drawdown thresholds as portfolio grows above initial.
+
+        As the portfolio reaches new highs, the stop thresholds tighten
+        proportionally. E.g., if portfolio doubled and tighten_pct=0.02,
+        thresholds tighten by 2% (0.15 → 0.13, 0.20 → 0.18).
+
+        Thresholds never tighten below 50% of their base value.
+        """
+        if not self._trailing_enabled or self._initial_portfolio <= 0:
+            return
+
+        growth = float(
+            (self._hwm - self._initial_portfolio) / self._initial_portfolio,
+        )
+        if growth <= 0:
+            return
+
+        tighten = growth * self._trailing_tighten_pct
+        floor_factor = 0.5  # Never tighten below 50% of base
+
+        self._max_dd_pct = max(
+            self._base_max_dd_pct * floor_factor,
+            self._base_max_dd_pct - tighten,
+        )
+        self._emergency_dd_pct = max(
+            self._base_emergency_dd_pct * floor_factor,
+            self._base_emergency_dd_pct - tighten,
+        )
+
+        # Ensure emergency always >= max
+        if self._emergency_dd_pct < self._max_dd_pct:
+            self._emergency_dd_pct = self._max_dd_pct
 
     def _classify_drawdown(self, dd_pct: float) -> DrawdownLevel:
         if dd_pct >= self._emergency_dd_pct:
