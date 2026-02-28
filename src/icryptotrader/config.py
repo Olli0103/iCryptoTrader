@@ -111,6 +111,7 @@ class Config:
     pair: str = "XBT/USD"
     log_level: str = "INFO"
     data_dir: str = "data"
+    ledger_path: str = "data/fifo_ledger.json"
     kraken: KrakenConfig = field(default_factory=KrakenConfig)
     grid: GridConfig = field(default_factory=GridConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)

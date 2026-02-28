@@ -27,7 +27,10 @@ from __future__ import annotations
 import logging
 import time
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
@@ -79,6 +82,7 @@ class StrategyLoop:
         regime_router: RegimeRouter,
         ledger: FIFOLedger,
         eur_usd_rate: Decimal = Decimal("1.08"),
+        ledger_path: Path | None = None,
     ) -> None:
         self._fee = fee_model
         self._om = order_manager
@@ -90,6 +94,7 @@ class StrategyLoop:
         self._regime = regime_router
         self._ledger = ledger
         self._eur_usd_rate = eur_usd_rate
+        self._ledger_path = ledger_path
 
         # Metrics
         self.ticks: int = 0
@@ -101,6 +106,16 @@ class StrategyLoop:
     def set_eur_usd_rate(self, rate: Decimal) -> None:
         """Update EUR/USD rate from ECB service."""
         self._eur_usd_rate = rate
+
+    def load_ledger(self) -> None:
+        """Load FIFO ledger from disk at startup."""
+        if self._ledger_path:
+            self._ledger.load(self._ledger_path)
+
+    def save_ledger(self) -> None:
+        """Save FIFO ledger to disk (called automatically after fills)."""
+        if self._ledger_path:
+            self._ledger.save(self._ledger_path)
 
     def tick(self, mid_price: Decimal) -> list[dict[str, Any]]:
         """Run one strategy tick. Returns list of commands to dispatch.
@@ -270,6 +285,9 @@ class StrategyLoop:
                     fill_qty, fill_price, order_id,
                 )
                 self._risk.force_risk_pause()
+
+        # Persist ledger to disk after every fill
+        self.save_ledger()
 
     def _dispatch_action(
         self, slot: Any, action: Any, slot_index: int,

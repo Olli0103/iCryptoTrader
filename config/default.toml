@@ -1,6 +1,7 @@
 pair = "XBT/USD"
 log_level = "INFO"
 data_dir = "data"
+ledger_path = "data/fifo_ledger.json"
 
 [kraken]
 api_key = ""
