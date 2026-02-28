@@ -2,6 +2,7 @@ pair = "XBT/USD"
 log_level = "INFO"
 data_dir = "data"
 ledger_path = "data/fifo_ledger.json"
+persistence_backend = "json"   # "json" or "sqlite"
 
 [kraken]
 api_key = ""
@@ -111,3 +112,16 @@ timeout_sec = 10
 enabled = false
 port = 9090
 prefix = "icryptotrader"
+
+[hedge]
+enabled = false
+trigger_drawdown_pct = 0.10    # Activate hedge at this drawdown level
+strategy = "reduce_exposure"   # "reduce_exposure" or "inverse_grid"
+max_reduction_pct = 0.50       # Max portion of buy levels to cancel
+
+[web]
+enabled = false
+port = 8080
+host = "127.0.0.1"
+username = ""                  # Basic auth (leave empty to disable)
+password = ""

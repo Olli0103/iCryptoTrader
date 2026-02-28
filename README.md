@@ -149,17 +149,21 @@ EMPTY ──add_order──> PENDING_NEW ──ack──> LIVE
 ```
 src/icryptotrader/
   __init__.py              # Package root, version
+  __main__.py              # CLI entry point (run / backtest / setup subcommands)
   types.py                 # Shared enums, dataclasses (HarvestRecommendation, FeeTier, ...)
   config.py                # TOML config loader with validation and typed dataclasses
   logging_setup.py         # Structured JSON / dev logging
   lifecycle.py             # Graceful shutdown, startup reconciliation, reconnect recovery
   metrics.py               # Prometheus-compatible metrics registry and HTTP server
+  watchdog.py              # Background process health monitor (tick rate, WS, memory)
+  pair_manager.py          # Multi-pair diversification with capital allocation + correlation
+  setup_wizard.py          # Interactive first-run configuration wizard
 
   strategy/
     strategy_loop.py       # Main tick orchestrator with ledger auto-save
     grid_engine.py         # Grid level computation
     regime_router.py       # EWMA vol / momentum regime classifier + VWAP tracking
-    bollinger.py           # Bollinger Band volatility-adaptive grid spacing
+    bollinger.py           # Bollinger Band + ATR volatility-adaptive grid spacing
     ai_signal.py           # Multi-provider AI signal engine (Gemini, Anthropic, OpenAI)
 
   order/
@@ -169,6 +173,7 @@ src/icryptotrader/
   risk/
     risk_manager.py        # Drawdown tracking, pause states, circuit breaker (with hysteresis)
     delta_skew.py          # Allocation deviation -> quote asymmetry
+    hedge_manager.py       # Portfolio delta reduction during adverse conditions
 
   inventory/
     inventory_arbiter.py   # BTC/USD allocation enforcement per regime
@@ -184,7 +189,7 @@ src/icryptotrader/
     fee_model.py           # Kraken fee tier schedule and profitability gate
 
   notify/
-    telegram.py            # Telegram notifications (fills, risk, tax, daily summary)
+    telegram.py            # Interactive Telegram bot (fills, risk, tax, P&L, inline keyboards)
 
   ws/
     ws_codec.py            # Kraken WS v2 message encode/decode (orjson)
@@ -192,10 +197,16 @@ src/icryptotrader/
     ws_private.py          # WS2: authenticated trading + executions + balances
     book_manager.py        # L2 order book with CRC32 checksum validation
 
+  web/
+    dashboard.py           # Async HTTP dashboard with status API and embedded HTML UI
+
+  backtest/
+    engine.py              # Historical price replay through the strategy loop
+
 config/
   default.toml             # Default configuration
 
-tests/                     # 441 tests across 26 test files
+tests/                     # 621 tests across 32 test files
 ```
 
 ## Configuration
@@ -205,6 +216,7 @@ All settings are defined in `config/default.toml`. Copy and customize:
 ```toml
 pair = "XBT/USD"
 log_level = "INFO"
+persistence_backend = "json"   # "json" or "sqlite"
 
 [kraken]
 api_key = ""        # Your Kraken API key
@@ -286,6 +298,27 @@ timeout_sec = 10
 enabled = false
 port = 9090
 prefix = "icryptotrader"
+
+[hedge]
+enabled = false
+trigger_drawdown_pct = 0.10    # Activate hedge at 10% drawdown
+strategy = "reduce_exposure"   # "reduce_exposure" or "inverse_grid"
+max_reduction_pct = 0.50       # Max portion of buy levels to cancel
+
+[web]
+enabled = false
+port = 8080
+host = "127.0.0.1"
+username = ""                  # Basic auth (leave empty to disable)
+password = ""
+
+# Multi-pair allocation (optional, repeatable section)
+# [[pairs]]
+# symbol = "XBT/USD"
+# weight = 0.7
+# [[pairs]]
+# symbol = "XBT/EUR"
+# weight = 0.3
 ```
 
 ## Installation
@@ -306,6 +339,30 @@ ruff check src/ tests/
 ```
 
 **Requirements**: Python 3.11+, websockets, orjson, pyzmq, httpx
+
+## Quick Start
+
+```bash
+# 1. Interactive setup — creates config/user.toml with your API keys
+python -m icryptotrader setup
+
+# 2. Run the bot (reads config/default.toml, overridden by config/user.toml)
+python -m icryptotrader run
+
+# 3. Run a backtest on historical price data (CSV: one price per line)
+python -m icryptotrader backtest --prices data/btc_prices.csv
+
+# 4. View CLI help
+python -m icryptotrader --help
+```
+
+### First-Time Checklist
+
+1. **Get Kraken API keys** — Create keys at [kraken.com/u/security/api](https://www.kraken.com/u/security/api) with "Create & Modify Orders" + "Query Open Orders & Trades" permissions
+2. **Run `python -m icryptotrader setup`** — The wizard walks you through API key entry, grid size, risk limits, and optional features (Telegram, AI signals)
+3. **Paper-trade first** — Start with `order_size_usd = "50"` and `grid.levels = 3` to validate behavior before scaling up
+4. **Enable Telegram** — Set `telegram.enabled = true` with your bot token and chat ID for real-time fill alerts and P&L summaries
+5. **Monitor** — Enable the web dashboard (`web.enabled = true`) at `http://localhost:8080` for real-time grid state and lot ages
 
 ## AI Signal Engine
 
@@ -343,27 +400,42 @@ Grid spacing is auto-calibrated to be profitable at your current Kraken fee tier
 ## Testing
 
 ```bash
-# Full suite (441 tests)
+# Full suite (621 tests)
 pytest -v
 
 # With coverage
 pytest --cov=icryptotrader --cov-report=term-missing
 
 # Specific module
-pytest tests/test_fifo_ledger.py -v     # FIFO ledger + underwater lots
-pytest tests/test_tax_agent.py -v       # Tax veto + harvest recommendations
-pytest tests/test_ai_signal.py -v       # AI signal engine (all providers)
-pytest tests/test_bollinger.py -v       # Bollinger Band spacing
-pytest tests/test_book_manager.py -v    # L2 book + CRC32 checksums
-pytest tests/test_config.py -v          # Config validation
-pytest tests/test_metrics.py -v         # Prometheus metrics
-pytest tests/test_order_manager.py -v
-pytest tests/test_strategy_loop.py -v
-pytest tests/test_lifecycle.py -v       # Graceful shutdown + reconciliation
-pytest tests/test_lot_viewer.py -v      # Lot age visualization
+pytest tests/test_fifo_ledger.py -v     # FIFO ledger + underwater lots (39 tests)
+pytest tests/test_telegram.py -v        # Interactive Telegram bot (57 tests)
+pytest tests/test_risk_manager.py -v    # Drawdown, pause states, circuit breaker (38 tests)
+pytest tests/test_order_manager.py -v   # Slot states, amend-first logic (33 tests)
+pytest tests/test_book_manager.py -v    # L2 book + CRC32 checksums (29 tests)
+pytest tests/test_tax_agent.py -v       # Tax veto + harvest recommendations (25 tests)
+pytest tests/test_strategy_loop.py -v   # Tick cycle, order dispatch (25 tests)
+pytest tests/test_ai_signal.py -v       # AI signal engine — all providers (24 tests)
+pytest tests/test_fee_model.py -v       # Fee tiers, profitability gates (24 tests)
+pytest tests/test_bollinger.py -v       # Bollinger Band + ATR spacing (23 tests)
+pytest tests/test_ws_codec.py -v        # WS v2 message codec (23 tests)
+pytest tests/test_config.py -v          # Config validation (21 tests)
+pytest tests/test_regime_router.py -v   # Regime classification + VWAP (20 tests)
+pytest tests/test_grid_engine.py -v     # Grid levels + spacing (19 tests)
+pytest tests/test_backtest.py -v        # Backtest simulation (18 tests)
+pytest tests/test_lifecycle.py -v       # Graceful shutdown + reconciliation (16 tests)
+pytest tests/test_pair_manager.py -v    # Multi-pair diversification (16 tests)
+pytest tests/test_tax_report.py -v      # Anlage SO export (16 tests)
+pytest tests/test_lot_viewer.py -v      # Lot age visualization (15 tests)
+pytest tests/test_main.py -v            # CLI entry point (12 tests)
+pytest tests/test_metrics.py -v         # Prometheus metrics (12 tests)
+pytest tests/test_backtest_engine.py -v # Backtest engine (11 tests)
+pytest tests/test_hedge_manager.py -v   # Hedge manager (10 tests)
+pytest tests/test_strategy_loop_wiring.py -v  # Bollinger, AI, SQLite wiring (10 tests)
+pytest tests/test_watchdog.py -v        # Process watchdog (5 tests)
+pytest tests/test_web_dashboard.py -v   # Web dashboard (7 tests)
 ```
 
-Test coverage spans all critical paths: FIFO lot accounting, underwater lot identification, tax-loss harvest recommendations, order state transitions, risk pause states, circuit breaker hysteresis, regime classification, VWAP tracking, fee tier resolution, rate limiting, WS codec, grid computation, delta skew, inventory allocation, tax agent veto logic, ECB rates, tax reporting, annual report automation, Bollinger Band spacing, L2 book checksums, Telegram notifications, graceful shutdown/reconciliation, lot age visualization, AI signal engine (Gemini/Anthropic/OpenAI), config validation, and structured metrics.
+Test coverage spans all critical paths: FIFO lot accounting, underwater lot identification, tax-loss harvest recommendations, order state transitions, risk pause states, circuit breaker hysteresis, regime classification, VWAP tracking, fee tier resolution, rate limiting, WS codec, grid computation, delta skew, inventory allocation, tax agent veto logic, ECB rates, tax reporting, annual report automation, Bollinger Band spacing, L2 book checksums, Telegram bot (interactive keyboards, polling), graceful shutdown/reconciliation, lot age visualization, AI signal engine (Gemini/Anthropic/OpenAI), config validation, structured metrics, web dashboard, process watchdog, hedge manager, multi-pair diversification, backtest engine, and CLI entry point wiring.
 
 ## Roadmap
 
@@ -385,7 +457,7 @@ Test coverage spans all critical paths: FIFO lot accounting, underwater lot iden
 - [x] **Circuit breaker hysteresis**: Cooldown period with 50% recovery threshold before re-entering trading after velocity freeze
 - [x] **Reconnect state recovery**: LifecycleManager reconciles order slots against exchange snapshots after reconnect, cancels orphan orders
 - [x] **Structured metrics export**: Prometheus-compatible metrics registry (counters, gauges, histograms) with built-in HTTP server
-- [ ] **Dashboard**: Grafana or web UI showing grid state, lot ages, portfolio allocation, tax countdown timers
+- [x] **Web dashboard**: Async HTTP server with real-time status API, lot ages, portfolio allocation, optional Basic auth
 
 ### Phase 4 — Strategy Enhancements (Implemented)
 
@@ -409,8 +481,6 @@ Test coverage spans all critical paths: FIFO lot accounting, underwater lot iden
 - [ ] Add `taker_bps` to `FeeTier.rt_cost_bps` as an option for non-post_only scenarios
 - [ ] REST fallback for order placement when WS2 is temporarily disconnected
 - [ ] FIX API support as alternative to WebSocket for lower-latency execution
-- [ ] Backtesting harness with historical tick data replay through the strategy loop
-- [ ] Dashboard (Grafana or web UI)
 
 ## License
 
