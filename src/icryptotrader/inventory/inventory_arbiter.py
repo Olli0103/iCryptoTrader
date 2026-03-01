@@ -71,9 +71,16 @@ class InventoryArbiter:
         limits: dict[Regime, AllocationLimits] | None = None,
         max_single_rebalance_pct: float = 0.10,
         max_rebalance_pct_per_min: float = 0.01,
+        dead_band_pct: float = 0.02,
     ) -> None:
         self._limits = limits or dict(DEFAULT_LIMITS)
         self._max_rebalance_pct = max_single_rebalance_pct
+
+        # Dead-band tolerance: ignores allocation drift within ±dead_band_pct
+        # of the target. Without this, the grid constantly skews to fight
+        # trivial allocation fluctuations, reducing fill rates on the
+        # profitable side of the spread.
+        self._dead_band_pct = max(0.0, dead_band_pct)
 
         # TWAP rate-limiting: track USD rebalanced per minute window
         self._max_rebalance_pct_per_min = max_rebalance_pct_per_min
@@ -162,6 +169,18 @@ class InventoryArbiter:
             max_buy_btc=max_buy_btc,
             max_sell_btc=max_sell_btc,
         )
+
+    def is_within_dead_band(self) -> bool:
+        """Check if current allocation is within dead-band of target.
+
+        When allocation drift is within ±dead_band_pct, the grid should
+        not skew to fight it — this preserves fill rates on both sides.
+        """
+        if self._dead_band_pct <= 0:
+            return False
+        limits = self.current_limits()
+        alloc = self.btc_allocation_pct
+        return abs(alloc - limits.target_pct) <= self._dead_band_pct
 
     def check_buy(self, qty_btc: Decimal) -> Decimal:
         """Check how much of a buy order is allowed. Returns clamped quantity."""
