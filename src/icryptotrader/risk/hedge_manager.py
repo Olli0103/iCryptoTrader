@@ -9,6 +9,14 @@ Strategies:
   - inverse_grid: Place additional sell orders at tighter spacing to
     accelerate exposure reduction.
 
+Collateral Segregation (§23 EStG Tax Protection):
+  If futures hedging is ever enabled, the hedge account MUST use Strict
+  Isolated Margin funded exclusively with fiat (USD/EUR) or stablecoins
+  (USDT/USDC).  Cross-margining spot BTC as collateral for derivatives
+  creates a catastrophic tax risk: if a futures position is liquidated,
+  the exchange seizes and sells spot BTC, resetting the 365-day Haltefrist
+  on those lots and triggering unexpected taxable events at up to 45%.
+
 Works with the existing PauseState system — does not override risk manager
 decisions, but can recommend grid modifications to tick().
 """
@@ -16,11 +24,36 @@ decisions, but can recommend grid modifications to tick().
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
+from decimal import Decimal
+from enum import Enum
 
 from icryptotrader.types import PauseState, Regime
 
 logger = logging.getLogger(__name__)
+
+
+class MarginMode(Enum):
+    """Margin mode for derivative hedge positions.
+
+    ISOLATED: Each position has its own margin pool — liquidation cannot
+              touch other positions or spot holdings.
+    CROSS:    All positions share a single margin pool — liquidation of
+              any position can seize spot crypto as collateral.
+
+    CROSS margin is PROHIBITED because it allows the exchange to
+    involuntarily sell spot BTC lots to cover derivative losses,
+    resetting the §23 EStG Haltefrist on those lots.
+    """
+
+    ISOLATED = "isolated"
+    CROSS = "cross"
+
+
+# Collateral types that are safe for derivative hedging.
+# Only fiat and stablecoins — never spot crypto holdings.
+SAFE_COLLATERAL_TYPES = frozenset({"USD", "EUR", "USDT", "USDC", "DAI"})
 
 
 @dataclass
@@ -55,12 +88,23 @@ class HedgeManager:
         trigger_drawdown_pct: float = 0.10,
         strategy: str = "reduce_exposure",
         max_reduction_pct: float = 0.50,
+        margin_mode: MarginMode = MarginMode.ISOLATED,
     ) -> None:
         self._trigger_dd = trigger_drawdown_pct
         self._strategy = strategy
         self._max_reduction = max_reduction_pct
         self._active = False
         self._activations: int = 0
+        self._margin_mode = margin_mode
+        self._collateral_violations: int = 0
+
+        # Enforce isolated margin — cross margin is a tax catastrophe
+        if margin_mode == MarginMode.CROSS:
+            raise ValueError(
+                "CROSS margin is prohibited: derivative liquidation would "
+                "seize spot BTC lots and reset the §23 EStG Haltefrist. "
+                "Use MarginMode.ISOLATED with fiat/stablecoin collateral."
+            )
 
     @property
     def is_active(self) -> bool:
@@ -69,6 +113,83 @@ class HedgeManager:
     @property
     def activations(self) -> int:
         return self._activations
+
+    @property
+    def margin_mode(self) -> MarginMode:
+        return self._margin_mode
+
+    @property
+    def collateral_violations(self) -> int:
+        return self._collateral_violations
+
+    def validate_collateral(self, collateral_type: str) -> bool:
+        """Check if the proposed collateral type is safe for hedging.
+
+        Only fiat and stablecoins are permitted.  Using spot crypto
+        (BTC, ETH, etc.) as derivative collateral creates a tax bomb:
+        forced liquidation sells the spot lots and resets Haltefrist.
+
+        Args:
+            collateral_type: Currency code (e.g., "USD", "BTC", "USDT").
+
+        Returns:
+            True if the collateral is safe, False if it would create
+            a cross-collateral tax risk.
+        """
+        is_safe = collateral_type.upper() in SAFE_COLLATERAL_TYPES
+        if not is_safe:
+            self._collateral_violations += 1
+            logger.critical(
+                "COLLATERAL VIOLATION: %s is not a safe collateral type "
+                "for derivative hedging — would risk §23 EStG Haltefrist "
+                "reset on forced liquidation. Use fiat or stablecoins only. "
+                "(violation #%d)",
+                collateral_type, self._collateral_violations,
+            )
+        return is_safe
+
+    @staticmethod
+    def hedge_contracts(
+        delta_btc: Decimal,
+        contract_size_btc: Decimal,
+    ) -> int:
+        """Compute the integer number of contracts to hedge spot delta.
+
+        Uses math.floor() to avoid the sliver deadlock: spot crypto has
+        8 decimal places but derivative contracts have quantized integer
+        multipliers.  Attempting to perfectly balance fractional deltas
+        causes an infinite loop of failed fractional orders.
+
+        The remaining un-hedgeable sliver (``delta_btc % contract_size_btc``)
+        is accepted as standard structural risk.
+
+        Args:
+            delta_btc: Spot delta to hedge (in BTC). Always positive.
+            contract_size_btc: Size of one derivative contract (in BTC).
+                E.g., Decimal("0.01") for a 0.01 BTC contract.
+
+        Returns:
+            Number of integer contracts to execute (always >= 0).
+        """
+        if contract_size_btc <= 0 or delta_btc <= 0:
+            return 0
+        return math.floor(delta_btc / contract_size_btc)
+
+    @staticmethod
+    def unhedgeable_sliver(
+        delta_btc: Decimal,
+        contract_size_btc: Decimal,
+    ) -> Decimal:
+        """Return the un-hedgeable BTC sliver after integer floor.
+
+        This is the residual exposure that cannot be offset because
+        derivative contracts have quantized (integer) multipliers.
+        """
+        if contract_size_btc <= 0 or delta_btc <= 0:
+            return Decimal("0")
+        contracts = math.floor(delta_btc / contract_size_btc)
+        hedged = contract_size_btc * contracts
+        return delta_btc - hedged
 
     def evaluate(
         self,

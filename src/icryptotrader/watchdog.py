@@ -43,6 +43,11 @@ class Watchdog:
         wd.stop()
     """
 
+    # Memory ceiling in MB — triggers immediate shutdown if exceeded.
+    # Prevents OOM-kill during TCP buffer bloat events where the OS
+    # kills the process without cleanup (losing unsaved FIFO ledger).
+    MEMORY_CEILING_MB = 1024
+
     def __init__(
         self,
         strategy_loop: StrategyLoop,
@@ -51,10 +56,12 @@ class Watchdog:
         check_interval: float = CHECK_INTERVAL_SEC,
         max_tick_age: float = MAX_TICK_AGE_SEC,
         max_failures: int = MAX_FAILURES,
+        ws_public: object | None = None,
     ) -> None:
         self._strategy = strategy_loop
         self._ws = ws_private
         self._lm = lifecycle_manager
+        self._ws_public = ws_public  # WSPublicFeed for queue depth monitoring
         self._interval = check_interval
         self._max_tick_age = max_tick_age
         self._max_failures = max_failures
@@ -65,6 +72,7 @@ class Watchdog:
         self.checks: int = 0
         self.failures: int = 0
         self.recoveries: int = 0
+        self.memory_shutdowns: int = 0
 
     def stop(self) -> None:
         """Signal the watchdog to stop."""
@@ -105,10 +113,31 @@ class Watchdog:
         if not self._ws.is_connected:
             issues.append("ws_disconnected")
 
-        # Check memory (basic — just log if high)
+        # Check WS1 queue depth (bounded queue backpressure)
+        if self._ws_public is not None:
+            queue = getattr(self._ws_public, "_msg_queue", None)
+            if queue is not None:
+                qsize = queue.qsize()
+                maxsize = getattr(self._ws_public, "_max_queue_size", 2000)
+                if qsize > maxsize * 0.8:
+                    issues.append(f"ws1_queue_high({qsize}/{maxsize})")
+
+        # Check memory — hard ceiling triggers immediate graceful shutdown
+        # to save the FIFO ledger before Linux OOM-killer strikes.
         try:
             import resource
             usage_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            if usage_mb > self.MEMORY_CEILING_MB:
+                self.memory_shutdowns += 1
+                logger.critical(
+                    "Watchdog: MEMORY CEILING breached (%dMB > %dMB) — "
+                    "forcing immediate graceful shutdown to save ledger",
+                    int(usage_mb), self.MEMORY_CEILING_MB,
+                )
+                self._running = False
+                if self._lm is not None:
+                    await self._lm.shutdown()
+                return
             if usage_mb > 512:
                 issues.append(f"high_memory({usage_mb:.0f}MB)")
         except (ImportError, AttributeError):
