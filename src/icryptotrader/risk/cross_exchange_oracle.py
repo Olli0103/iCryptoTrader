@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -345,10 +346,14 @@ class CrossExchangeOracle:
             except Exception as e:
                 self.reconnects += 1
                 attempt = min(attempt + 1, len(backoff) - 1)
-                wait = backoff[attempt]
+                base_wait = backoff[attempt]
+                # Full jitter: randomize [0, base_wait] to prevent
+                # thundering herd when many oracle instances reconnect
+                # simultaneously after a Binance WS outage.
+                wait = random.uniform(0, base_wait) if base_wait > 0 else 0.0  # noqa: S311
                 logger.warning(
-                    "Binance oracle disconnected: %s (reconnect in %.1fs)",
-                    e, wait,
+                    "Binance oracle disconnected: %s (reconnect in %.1fs, base=%.1fs)",
+                    e, wait, base_wait,
                 )
                 await asyncio.sleep(wait)
 

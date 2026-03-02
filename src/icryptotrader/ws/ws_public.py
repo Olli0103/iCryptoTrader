@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -86,15 +87,19 @@ class WSPublicFeed:
                 logger.warning("WS1 disconnected: %s", e)
                 self.reconnects += 1
                 self._reconnect_count += 1
-                backoff = _RECONNECT_SCHEDULE[
+                base_backoff = _RECONNECT_SCHEDULE[
                     min(self._reconnect_count, len(_RECONNECT_SCHEDULE) - 1)
                 ]
-                if backoff > 0:
+                if base_backoff > 0:
+                    # Full jitter: randomize [0, base_backoff] to prevent
+                    # thundering herd when all clients reconnect at once
+                    # after a brief exchange outage.
+                    jittered = random.uniform(0, base_backoff)  # noqa: S311
                     logger.info(
-                        "WS1 reconnecting in %.1fs (attempt %d)",
-                        backoff, self._reconnect_count,
+                        "WS1 reconnecting in %.1fs (attempt %d, base=%.1fs)",
+                        jittered, self._reconnect_count, base_backoff,
                     )
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(jittered)
 
     async def stop(self) -> None:
         """Graceful shutdown."""

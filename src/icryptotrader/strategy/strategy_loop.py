@@ -107,6 +107,13 @@ class StrategyLoop:
     # Maximum orders per batch_add frame (Kraken WS v2 limit).
     _MAX_BATCH_SIZE = 15
 
+    # Zombie Grid Sweep: hourly background check cancels orders stranded
+    # far from mid-price.  After a large move, old grid levels may sit
+    # N σ away from the current mid, stranding capital in orders that will
+    # never fill.  The sweep releases that capital back to the active grid.
+    _ZOMBIE_SWEEP_INTERVAL_SEC = 3600.0  # 1 hour
+    _ZOMBIE_SIGMA_THRESHOLD = 3.0  # cancel if > 3σ from mid
+
     def __init__(
         self,
         fee_model: FeeModel,
@@ -216,6 +223,10 @@ class StrategyLoop:
         self._price_history_24h: deque[tuple[float, Decimal]] = deque(maxlen=86400)
         self._price_history_1h_last_ts: float = 0.0
         self._price_history_24h_last_ts: float = 0.0
+
+        # Zombie grid sweep: tracks last sweep time and cancelled count
+        self._last_zombie_sweep_ts: float = 0.0
+        self.zombie_cancels: int = 0
 
         # Metrics
         self.ticks: int = 0
@@ -712,7 +723,12 @@ class StrategyLoop:
             if cmd is not None:
                 commands.append(cmd)
 
-        # 11. Aggregate add commands into batch_add frames to reduce
+        # 11. Zombie Grid Sweep: periodically cancel orders stranded far
+        # from mid-price to free capital back to the active grid.
+        zombie_cmds = self.zombie_sweep(mid_price)
+        commands.extend(zombie_cmds)
+
+        # 12. Aggregate add commands into batch_add frames to reduce
         # rate limit consumption. Kraken WS v2 batch_add sends up to 15
         # orders per frame at the cost of 1 rate-limit counter increment.
         commands = self._aggregate_batch_adds(commands)
@@ -756,6 +772,68 @@ class StrategyLoop:
             })
 
         return result
+
+    def zombie_sweep(self, mid_price: Decimal) -> list[dict[str, Any]]:
+        """Sweep for zombie orders stranded far from current mid-price.
+
+        After a large market move, old grid levels can sit N σ away from
+        the current mid-price, stranding capital in orders that will never
+        fill.  This hourly sweep cancels those zombies and releases the
+        capital back to the active grid.
+
+        An order is a "zombie" if its distance from mid exceeds
+        ``_ZOMBIE_SIGMA_THRESHOLD * ewma_volatility * mid_price``.
+
+        Returns cancel commands for each zombie found.
+        """
+        now = time.monotonic()
+        if now - self._last_zombie_sweep_ts < self._ZOMBIE_SWEEP_INTERVAL_SEC:
+            return []
+        self._last_zombie_sweep_ts = now
+
+        if mid_price <= 0:
+            return []
+
+        # Use EWMA volatility from regime router as σ estimate.
+        # ewma_volatility is a fractional value (e.g., 0.005 = 0.5%).
+        vol = self._regime.ewma_volatility
+        if vol <= 0:
+            return []
+
+        threshold_price = mid_price * Decimal(str(vol * self._ZOMBIE_SIGMA_THRESHOLD))
+        if threshold_price <= 0:
+            return []
+
+        commands: list[dict[str, Any]] = []
+        from icryptotrader.types import SlotState
+
+        for idx, slot in enumerate(self._om.slots):
+            if slot.state != SlotState.LIVE:
+                continue
+            if slot.price <= 0:
+                continue
+
+            distance = abs(slot.price - mid_price)
+            if distance > threshold_price:
+                self.zombie_cancels += 1
+                logger.warning(
+                    "Zombie sweep: cancelling slot %d (%s @ %s) — "
+                    "%.0f bps from mid (threshold=%.0f bps)",
+                    idx, slot.side.value, slot.price,
+                    float(distance / mid_price) * 10000,
+                    float(threshold_price / mid_price) * 10000,
+                )
+                commands.append({
+                    "type": "cancel", "slot_id": idx,
+                    "params": {"order_id": slot.order_id},
+                })
+
+        if commands:
+            logger.info(
+                "Zombie sweep: cancelled %d stranded orders (σ=%.4f, threshold=%s)",
+                len(commands), vol, threshold_price,
+            )
+        return commands
 
     def on_fill(self, slot: Any, fill_data: dict[str, Any]) -> None:
         """Handle a fill event — update FIFO ledger.
