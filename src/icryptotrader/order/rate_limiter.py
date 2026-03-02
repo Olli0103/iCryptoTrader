@@ -82,11 +82,21 @@ class RateLimiter:
     def update_from_server(self, server_rate_count: float) -> None:
         """Sync from the authoritative rate_count in executions channel.
 
-        This corrects any drift in our local estimate.
+        Only accepts the server value if it is more restrictive (higher)
+        than our current local estimate. Because WS messages can arrive
+        out-of-order or clumped via TCP buffering, a stale rate_count
+        could artificially lower our local estimate, temporarily inflating
+        available headroom right before a burst — causing dropped commands.
+
+        If the server reports a lower count than our local estimate, it
+        means the server has decayed further than we tracked, which is
+        safe to ignore (our estimate is already more conservative).
         """
+        self._decay()  # Apply decay before comparing
         self._authoritative_count = server_rate_count
-        self._estimated_count = server_rate_count
-        self._last_update_ts = time.monotonic()
+        if server_rate_count >= self._estimated_count:
+            self._estimated_count = server_rate_count
+            self._last_update_ts = time.monotonic()
 
     def cost_for_method(self, method: str) -> float:
         """Return the rate limit cost for a given command method."""

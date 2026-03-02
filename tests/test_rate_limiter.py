@@ -59,17 +59,27 @@ class TestDecay:
 
 
 class TestServerSync:
-    def test_update_from_server(self) -> None:
+    def test_update_from_server_higher_accepted(self) -> None:
+        """Server reporting higher count (more restrictive) is accepted."""
         rl = RateLimiter(decay_rate=0.0)
-        rl.record_send(50.0)
-        rl.update_from_server(30.0)  # Server says counter is 30
-        assert rl.estimated_count == 30.0
+        rl.record_send(30.0)
+        rl.update_from_server(50.0)  # Server says counter is 50 (higher)
+        assert rl.estimated_count == 50.0
 
-    def test_server_overrides_local(self) -> None:
+    def test_server_lower_ignored(self) -> None:
+        """Server reporting lower count (stale event) is ignored to prevent
+        artificially inflating headroom before a burst."""
         rl = RateLimiter(decay_rate=0.0)
         rl.record_send(100.0)
-        rl.update_from_server(5.0)  # Server knows better
-        assert rl.estimated_count == 5.0
+        rl.update_from_server(5.0)  # Stale server event — ignored
+        assert rl.estimated_count == 100.0  # Conservative local estimate kept
+
+    def test_authoritative_count_always_stored(self) -> None:
+        """The authoritative count is always stored for reference."""
+        rl = RateLimiter(decay_rate=0.0)
+        rl.record_send(50.0)
+        rl.update_from_server(30.0)
+        assert rl._authoritative_count == 30.0
 
 
 class TestMethodCosts:

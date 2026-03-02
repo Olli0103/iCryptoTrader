@@ -224,7 +224,13 @@ class OrderManager:
             if desired is None:
                 return Action.CancelOrder(slot.order_id)
 
-            qty_changed = abs(slot.remaining_qty() - desired.qty) > QTY_EPSILON
+            # Compare desired qty against slot.qty (total order size), NOT
+            # remaining_qty(). After a partial fill, remaining_qty shrinks but
+            # the grid's desired size hasn't changed. Comparing against
+            # remaining_qty would cause the bot to constantly amend partially-
+            # filled orders back to their original size, destroying queue
+            # priority and spamming the matching engine.
+            qty_changed = abs(slot.qty - desired.qty) > QTY_EPSILON
             side_changed = slot.side != desired.side
 
             # Side change requires cancel+new (can't amend side)
@@ -515,8 +521,20 @@ class OrderManager:
         Called after WS2 reconnects and receives executions snapshot.
         Returns a list of orphan order IDs (orders on the exchange that
         don't match any local slot). The caller should cancel these.
+
+        CRITICAL: When snapshot.filled_qty > local.filled_qty, the delta
+        represents fills that occurred while disconnected. We synthesize
+        fill callbacks so the FIFO ledger stays in sync with exchange state.
+        Without this, the tax ledger silently desyncs and the InventoryArbiter
+        leaks delta.
         """
         snapshot_order_ids = {o.get("order_id", ""): o for o in open_orders}
+        # Index recent trades by order_id for price/fee lookup on missed fills
+        trades_by_order: dict[str, list[dict[str, Any]]] = {}
+        for trade in recent_trades:
+            oid = trade.get("order_id", "")
+            if oid:
+                trades_by_order.setdefault(oid, []).append(trade)
 
         for slot in self._slots:
             if slot.state == SlotState.EMPTY:
@@ -526,9 +544,21 @@ class OrderManager:
                 # Order still exists — update from snapshot
                 snap = snapshot_order_ids.pop(slot.order_id)
                 slot.state = SlotState.LIVE
-                slot.price = Decimal(str(snap.get("limit_price", slot.price)))
-                slot.qty = Decimal(str(snap.get("order_qty", slot.qty)))
-                slot.filled_qty = Decimal(str(snap.get("filled_qty", slot.filled_qty)))
+                snap_price = Decimal(str(snap.get("limit_price", slot.price)))
+                snap_qty = Decimal(str(snap.get("order_qty", slot.qty)))
+                snap_filled = Decimal(str(snap.get("filled_qty", slot.filled_qty)))
+
+                # Detect fills that occurred during disconnect
+                fill_delta = snap_filled - slot.filled_qty
+                if fill_delta > 0:
+                    self._fire_synthetic_fills(
+                        slot, fill_delta, snap_price,
+                        trades_by_order.get(slot.order_id, []),
+                    )
+
+                slot.price = snap_price
+                slot.qty = snap_qty
+                slot.filled_qty = snap_filled
                 logger.info(
                     "Slot %d: reconciled from snapshot, order_id=%s, price=%s, qty=%s",
                     slot.slot_id, slot.order_id, slot.price, slot.qty,
@@ -538,11 +568,22 @@ class OrderManager:
                 found = False
                 for oid, snap in list(snapshot_order_ids.items()):
                     if snap.get("cl_ord_id") == slot.cl_ord_id:
+                        snap_filled = Decimal(str(snap.get("filled_qty", "0")))
+                        snap_price = Decimal(str(snap.get("limit_price", slot.price)))
+
+                        # Detect fills during disconnect
+                        fill_delta = snap_filled - slot.filled_qty
+                        if fill_delta > 0:
+                            self._fire_synthetic_fills(
+                                slot, fill_delta, snap_price,
+                                trades_by_order.get(oid, []),
+                            )
+
                         slot.state = SlotState.LIVE
                         slot.order_id = oid
-                        slot.price = Decimal(str(snap.get("limit_price", slot.price)))
+                        slot.price = snap_price
                         slot.qty = Decimal(str(snap.get("order_qty", slot.qty)))
-                        slot.filled_qty = Decimal(str(snap.get("filled_qty", "0")))
+                        slot.filled_qty = snap_filled
                         self._order_id_to_slot[oid] = slot
                         snapshot_order_ids.pop(oid)
                         found = True
@@ -552,7 +593,16 @@ class OrderManager:
                         )
                         break
                 if not found:
-                    # Order gone — was filled or cancelled during disconnect
+                    # Order gone — was filled or cancelled during disconnect.
+                    # If there are recent trades for this order, fire synthetic
+                    # fills before clearing the slot.
+                    order_trades = trades_by_order.get(slot.order_id, [])
+                    if order_trades:
+                        remaining = slot.qty - slot.filled_qty
+                        if remaining > 0:
+                            self._fire_synthetic_fills(
+                                slot, remaining, slot.price, order_trades,
+                            )
                     slot.state = SlotState.EMPTY
                     logger.info(
                         "Slot %d: order disappeared during disconnect (filled or cancelled)",
@@ -573,6 +623,66 @@ class OrderManager:
             )
 
         return orphan_ids
+
+    def _fire_synthetic_fills(
+        self,
+        slot: OrderSlot,
+        fill_qty: Decimal,
+        fallback_price: Decimal,
+        recent_trades: list[dict[str, Any]],
+    ) -> None:
+        """Fire synthetic fill callbacks for fills that occurred during disconnect.
+
+        Uses recent_trades to get accurate fill prices/fees when available.
+        Falls back to the order's limit price if no trade data is available.
+        """
+        if not self._on_fill:
+            return
+
+        # Try to reconstruct fills from recent trades
+        remaining = fill_qty
+        for trade in recent_trades:
+            if remaining <= 0:
+                break
+            trade_qty = Decimal(str(trade.get("qty", trade.get("last_qty", "0"))))
+            if trade_qty <= 0:
+                continue
+            used_qty = min(trade_qty, remaining)
+            fill_data = {
+                "last_qty": str(used_qty),
+                "last_price": str(trade.get("price", trade.get("last_price", fallback_price))),
+                "fee": str(trade.get("fee", "0")),
+                "order_id": slot.order_id,
+                "trade_id": trade.get("trade_id", ""),
+                "synthetic": True,  # Flag so callers know this is a reconstruction
+            }
+            for cb in self._on_fill:
+                try:
+                    cb(slot, fill_data)
+                except Exception:
+                    logger.exception("Synthetic fill callback error")
+            remaining -= used_qty
+
+        # If trades didn't cover the full delta, fire a single catchall fill
+        if remaining > 0:
+            fill_data = {
+                "last_qty": str(remaining),
+                "last_price": str(fallback_price),
+                "fee": "0",
+                "order_id": slot.order_id,
+                "trade_id": "",
+                "synthetic": True,
+            }
+            logger.warning(
+                "Slot %d: %s BTC of disconnect fill could not be matched to "
+                "recent trades — using limit price %s as fallback",
+                slot.slot_id, remaining, fallback_price,
+            )
+            for cb in self._on_fill:
+                try:
+                    cb(slot, fill_data)
+                except Exception:
+                    logger.exception("Synthetic fill callback error")
 
     # --- Query methods ---
 
