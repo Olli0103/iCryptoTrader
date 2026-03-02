@@ -19,6 +19,15 @@ from icryptotrader.types import Regime
 
 logger = logging.getLogger(__name__)
 
+# Kraken minimum order size in BTC.  Orders below this are rejected with
+# "Order size too small".  If the inventory correction needed is smaller
+# than this, we must suppress the order to prevent an infinite API spam
+# loop where the bot tries every tick (100ms) and gets rejected every time.
+DUST_THRESHOLD_BTC = Decimal("0.0001")
+# Minimum notional value in USD for a correction to be worth executing.
+# Prevents dust-level corrections that burn API rate limits for zero ROI.
+DUST_THRESHOLD_USD = Decimal("5")
+
 
 @dataclass
 class AllocationLimits:
@@ -243,7 +252,12 @@ class InventoryArbiter:
         return 1.0 + math.log(1.0 + duration / self._inventory_half_life_sec)
 
     def check_buy(self, qty_btc: Decimal) -> Decimal:
-        """Check how much of a buy order is allowed. Returns clamped quantity."""
+        """Check how much of a buy order is allowed. Returns clamped quantity.
+
+        Enforces dust dead-band: if the resulting quantity is below Kraken's
+        minimum order size or the notional value is below DUST_THRESHOLD_USD,
+        returns 0 to prevent infinite API spam loops from micro-corrections.
+        """
         if self._btc_price <= 0:
             return Decimal("0")
 
@@ -254,10 +268,23 @@ class InventoryArbiter:
             return Decimal("0")
 
         max_allowed = self._max_buy_btc(alloc, limits, self.portfolio_value_usd)
-        return min(qty_btc, max_allowed)
+        result = min(qty_btc, max_allowed)
+
+        # Dust dead-band: suppress sub-minimum orders
+        if result < DUST_THRESHOLD_BTC:
+            return Decimal("0")
+        if result * self._btc_price < DUST_THRESHOLD_USD:
+            return Decimal("0")
+
+        return result
 
     def check_sell(self, qty_btc: Decimal) -> Decimal:
-        """Check how much of a sell order is allowed. Returns clamped quantity."""
+        """Check how much of a sell order is allowed. Returns clamped quantity.
+
+        Enforces dust dead-band: if the resulting quantity is below Kraken's
+        minimum order size or the notional value is below DUST_THRESHOLD_USD,
+        returns 0 to prevent infinite API spam loops from micro-corrections.
+        """
         if self._btc_price <= 0:
             return Decimal("0")
 
@@ -268,7 +295,15 @@ class InventoryArbiter:
             return Decimal("0")
 
         max_allowed = self._max_sell_btc(alloc, limits, self.portfolio_value_usd)
-        return min(qty_btc, max_allowed, self._btc_balance)
+        result = min(qty_btc, max_allowed, self._btc_balance)
+
+        # Dust dead-band: suppress sub-minimum orders
+        if result < DUST_THRESHOLD_BTC:
+            return Decimal("0")
+        if result * self._btc_price < DUST_THRESHOLD_USD:
+            return Decimal("0")
+
+        return result
 
     def _twap_remaining_usd(self, total_usd: Decimal) -> Decimal:
         """USD budget remaining in the current TWAP window (1 minute).

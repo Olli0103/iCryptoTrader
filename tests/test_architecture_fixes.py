@@ -30,6 +30,9 @@ Covers:
   27. CRC32 string-formatting trap (scientific notation)
   28. Zero-fee division error
   29. Thundering Herd — reconnection jitter
+  30. REST Audit Loop — phantom fill reconciliation
+  31. FIFO Splinter Trade — tax-lot boundary crossing
+  32. Inventory Dust Deadlock — minimum trade size dead-band
 """
 
 from __future__ import annotations
@@ -2962,3 +2965,338 @@ class TestThunderingHerdJitter:
         # Full jitter of 0 is always 0
         result = random.uniform(0, base) if base > 0 else 0.0
         assert result == 0.0
+
+
+# =============================================================================
+# 30. REST Audit Loop — Phantom Fill Reconciliation
+# =============================================================================
+
+class TestRESTAuditLoop:
+    """Tests for the REST-based reconciliation that catches phantom fills."""
+
+    def test_audit_not_before_interval(self) -> None:
+        """Audit should not run until interval has elapsed."""
+        loop = _make_loop()
+        loop._last_rest_audit_ts = time.monotonic()  # just audited
+        orphans = loop.rest_audit(open_orders=[], recent_trades=[])
+        assert orphans == []
+        assert loop.rest_audit_count == 0
+
+    def test_audit_runs_after_interval(self) -> None:
+        """Audit should run once the interval has passed."""
+        loop = _make_loop()
+        loop._last_rest_audit_ts = (
+            time.monotonic() - loop._REST_AUDIT_INTERVAL_SEC - 1
+        )
+        orphans = loop.rest_audit(open_orders=[], recent_trades=[])
+        assert loop.rest_audit_count == 1
+        assert orphans == []
+
+    def test_audit_detects_phantom_fill(self) -> None:
+        """If a slot shows filled_qty delta vs snapshot, fill is injected."""
+        loop = _make_loop()
+        loop._last_rest_audit_ts = (
+            time.monotonic() - loop._REST_AUDIT_INTERVAL_SEC - 1
+        )
+
+        # Set up a slot as LIVE with no fills yet
+        slot = loop._om.slots[0]
+        slot.state = SlotState.LIVE
+        slot.order_id = "ORDER-1"
+        slot.cl_ord_id = "cl-1"
+        slot.price = Decimal("85000")
+        slot.qty = Decimal("0.01")
+        slot.filled_qty = Decimal("0")
+        slot.side = Side.BUY
+        loop._om._order_id_to_slot["ORDER-1"] = slot
+
+        # Simulate exchange showing this order with partial fill
+        open_orders = [{
+            "order_id": "ORDER-1",
+            "cl_ord_id": "cl-1",
+            "limit_price": "85000",
+            "order_qty": "0.01",
+            "filled_qty": "0.005",  # Phantom fill!
+        }]
+        recent_trades = [{
+            "order_id": "ORDER-1",
+            "qty": "0.005",
+            "price": "85000",
+            "fee": "0.10",
+            "trade_id": "trade-phantom-1",
+        }]
+
+        pre_fills = loop.fills_today
+        orphans = loop.rest_audit(open_orders, recent_trades)
+        # The synthetic fill should have been injected via on_fill
+        assert loop.fills_today > pre_fills
+        assert loop.phantom_fills_injected > 0
+
+    def test_audit_returns_orphan_orders(self) -> None:
+        """Orders on exchange not tracked locally should be returned as orphans."""
+        loop = _make_loop()
+        loop._last_rest_audit_ts = (
+            time.monotonic() - loop._REST_AUDIT_INTERVAL_SEC - 1
+        )
+
+        # No local slots are LIVE, but exchange has an order
+        open_orders = [{
+            "order_id": "ORPHAN-1",
+            "cl_ord_id": "unknown-cl",
+            "limit_price": "82000",
+            "order_qty": "0.01",
+            "filled_qty": "0",
+        }]
+        orphans = loop.rest_audit(open_orders, recent_trades=[])
+        assert "ORPHAN-1" in orphans
+
+    def test_audit_consistent_state_no_phantom(self) -> None:
+        """When local and exchange state match, no phantom fills are injected."""
+        loop = _make_loop()
+        loop._last_rest_audit_ts = (
+            time.monotonic() - loop._REST_AUDIT_INTERVAL_SEC - 1
+        )
+
+        slot = loop._om.slots[0]
+        slot.state = SlotState.LIVE
+        slot.order_id = "ORDER-2"
+        slot.price = Decimal("85000")
+        slot.qty = Decimal("0.01")
+        slot.filled_qty = Decimal("0")
+        slot.side = Side.BUY
+        loop._om._order_id_to_slot["ORDER-2"] = slot
+
+        open_orders = [{
+            "order_id": "ORDER-2",
+            "limit_price": "85000",
+            "order_qty": "0.01",
+            "filled_qty": "0",  # No fill delta
+        }]
+        pre_fills = loop.fills_today
+        loop.rest_audit(open_orders, recent_trades=[])
+        assert loop.fills_today == pre_fills
+        assert loop.phantom_fills_injected == 0
+
+
+# =============================================================================
+# 31. FIFO Splinter Trade — Tax-Lot Boundary Crossing
+# =============================================================================
+
+class TestFIFOSplinterTrade:
+    """Tests for splintering fills across tax-lot boundaries."""
+
+    def test_single_lot_no_splinter(self) -> None:
+        """Selling from a single lot should produce splinter_index=0."""
+        ledger = FIFOLedger()
+        ledger.add_lot(
+            quantity_btc=Decimal("1.0"),
+            purchase_price_usd=Decimal("80000"),
+            purchase_fee_usd=Decimal("5"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+
+        disposals = ledger.sell_fifo(
+            quantity_btc=Decimal("0.5"),
+            sale_price_usd=Decimal("85000"),
+            sale_fee_usd=Decimal("3"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+        assert len(disposals) == 1
+        assert disposals[0].splinter_index == 0
+
+    def test_cross_lot_boundary_splinter(self) -> None:
+        """Selling across two lots should produce two disposals with splinter indices."""
+        ledger = FIFOLedger()
+
+        # Lot 1: 0.6 BTC (old, tax-free)
+        from datetime import timedelta
+        old_ts = datetime.now(UTC) - timedelta(days=400)
+        lot1 = ledger.add_lot(
+            quantity_btc=Decimal("0.6"),
+            purchase_price_usd=Decimal("60000"),
+            purchase_fee_usd=Decimal("3"),
+            eur_usd_rate=Decimal("1.10"),
+            purchase_timestamp=old_ts,
+        )
+
+        # Lot 2: 0.5 BTC (recent, taxable)
+        lot2 = ledger.add_lot(
+            quantity_btc=Decimal("0.5"),
+            purchase_price_usd=Decimal("80000"),
+            purchase_fee_usd=Decimal("4"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+
+        # Sell 1.0 BTC — crosses lot boundary
+        disposals = ledger.sell_fifo(
+            quantity_btc=Decimal("1.0"),
+            sale_price_usd=Decimal("85000"),
+            sale_fee_usd=Decimal("5"),
+            eur_usd_rate=Decimal("1.08"),
+            exchange_trade_id="trade-123",
+        )
+
+        # Should produce two disposals (splintered)
+        assert len(disposals) == 2
+
+        # First disposal: from lot 1 (tax-free), 0.6 BTC
+        assert disposals[0].quantity_btc == Decimal("0.6")
+        assert disposals[0].lot_id == lot1.lot_id
+        assert disposals[0].splinter_index == 0
+        assert disposals[0].is_taxable is False  # >365 days
+
+        # Second disposal: from lot 2 (taxable), 0.4 BTC
+        assert disposals[1].quantity_btc == Decimal("0.4")
+        assert disposals[1].lot_id == lot2.lot_id
+        assert disposals[1].splinter_index == 1
+        assert disposals[1].is_taxable is True  # <365 days
+
+        # Both share the same exchange_trade_id
+        assert disposals[0].exchange_trade_id == "trade-123"
+        assert disposals[1].exchange_trade_id == "trade-123"
+
+    def test_fee_proportional_split(self) -> None:
+        """Fees should be split proportionally across splintered disposals."""
+        ledger = FIFOLedger()
+
+        ledger.add_lot(
+            quantity_btc=Decimal("0.6"),
+            purchase_price_usd=Decimal("80000"),
+            purchase_fee_usd=Decimal("3"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+        ledger.add_lot(
+            quantity_btc=Decimal("0.5"),
+            purchase_price_usd=Decimal("80000"),
+            purchase_fee_usd=Decimal("4"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+
+        # Sell 1.0 BTC with $10 fee
+        disposals = ledger.sell_fifo(
+            quantity_btc=Decimal("1.0"),
+            sale_price_usd=Decimal("85000"),
+            sale_fee_usd=Decimal("10"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+
+        # 0.6/1.0 * $10 = $6.0 for first disposal
+        assert disposals[0].sale_fee_usd == Decimal("6.0")
+        # 0.4/1.0 * $10 = $4.0 for second disposal
+        assert disposals[1].sale_fee_usd == Decimal("4.0")
+        # Total fees should equal original
+        total_fee = sum(d.sale_fee_usd for d in disposals)
+        assert total_fee == Decimal("10")
+
+    def test_three_lot_splinter(self) -> None:
+        """Selling across three lots produces three splintered disposals."""
+        ledger = FIFOLedger()
+
+        for i in range(3):
+            ledger.add_lot(
+                quantity_btc=Decimal("0.3"),
+                purchase_price_usd=Decimal("80000"),
+                purchase_fee_usd=Decimal("1"),
+                eur_usd_rate=Decimal("1.08"),
+            )
+
+        disposals = ledger.sell_fifo(
+            quantity_btc=Decimal("0.8"),
+            sale_price_usd=Decimal("85000"),
+            sale_fee_usd=Decimal("4"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+
+        # 0.3 + 0.3 + 0.2 = 0.8 → three disposals
+        assert len(disposals) == 3
+        assert disposals[0].splinter_index == 0
+        assert disposals[1].splinter_index == 1
+        assert disposals[2].splinter_index == 2
+        assert disposals[0].quantity_btc == Decimal("0.3")
+        assert disposals[1].quantity_btc == Decimal("0.3")
+        assert disposals[2].quantity_btc == Decimal("0.2")
+
+
+# =============================================================================
+# 32. Inventory Dust Deadlock — Minimum Trade Size Dead-Band
+# =============================================================================
+
+class TestInventoryDustDeadlock:
+    """Tests for dust-level order suppression to prevent API spam."""
+
+    def test_normal_buy_allowed(self) -> None:
+        """Normal-sized buy should pass through."""
+        inv = InventoryArbiter()
+        inv.update_balances(btc=Decimal("0.01"), usd=Decimal("5000"))
+        inv.update_price(Decimal("85000"))
+
+        result = inv.check_buy(Decimal("0.005"))
+        assert result > 0
+
+    def test_dust_buy_suppressed(self) -> None:
+        """Sub-minimum buy should return 0."""
+        inv = InventoryArbiter()
+        inv.update_balances(btc=Decimal("0.01"), usd=Decimal("5000"))
+        inv.update_price(Decimal("85000"))
+
+        # Below DUST_THRESHOLD_BTC (0.0001)
+        result = inv.check_buy(Decimal("0.00005"))
+        assert result == Decimal("0")
+
+    def test_dust_sell_suppressed(self) -> None:
+        """Sub-minimum sell should return 0."""
+        inv = InventoryArbiter()
+        inv.update_balances(btc=Decimal("0.5"), usd=Decimal("2000"))
+        inv.update_price(Decimal("85000"))
+
+        # Below DUST_THRESHOLD_BTC (0.0001)
+        result = inv.check_sell(Decimal("0.00005"))
+        assert result == Decimal("0")
+
+    def test_notional_dust_buy_suppressed(self) -> None:
+        """Buy above BTC minimum but below USD minimum should be suppressed."""
+        from icryptotrader.inventory.inventory_arbiter import DUST_THRESHOLD_USD
+
+        inv = InventoryArbiter()
+        inv.update_balances(btc=Decimal("0.01"), usd=Decimal("5000"))
+        inv.update_price(Decimal("10000"))  # Low price so BTC min passes
+
+        # 0.0002 BTC * $10,000 = $2.00 < $5.00 threshold
+        result = inv.check_buy(Decimal("0.0002"))
+        assert result == Decimal("0")
+
+    def test_normal_sell_passes_dust_check(self) -> None:
+        """Sell above both thresholds should pass through."""
+        inv = InventoryArbiter()
+        inv.update_balances(btc=Decimal("0.5"), usd=Decimal("2000"))
+        inv.update_price(Decimal("85000"))
+
+        result = inv.check_sell(Decimal("0.01"))
+        assert result > 0
+
+    def test_dust_constants_exported(self) -> None:
+        """DUST_THRESHOLD_BTC and DUST_THRESHOLD_USD should be accessible."""
+        from icryptotrader.inventory.inventory_arbiter import (
+            DUST_THRESHOLD_BTC,
+            DUST_THRESHOLD_USD,
+        )
+
+        assert DUST_THRESHOLD_BTC > 0
+        assert DUST_THRESHOLD_USD > 0
+
+    def test_clamped_buy_below_dust(self) -> None:
+        """When max_allowed clamps buy to dust level, return 0 instead of dust."""
+        inv = InventoryArbiter(
+            max_single_rebalance_pct=0.001,  # very small rebalance allowed
+        )
+        inv.update_balances(btc=Decimal("0.49"), usd=Decimal("100"))
+        inv.update_price(Decimal("85000"))
+
+        # With max_rebalance_pct=0.001 and portfolio ~$41750,
+        # max_usd = ~$41.75, max_btc = ~0.00049
+        # But also capped by available USD ($100) and TWAP budget
+        # Request 1 BTC → clamped to max_allowed → possibly dust
+        result = inv.check_buy(Decimal("1.0"))
+        # Either a valid size or 0 (dust suppressed), never a rejected dust amount
+        from icryptotrader.inventory.inventory_arbiter import DUST_THRESHOLD_BTC
+        assert result == Decimal("0") or result >= DUST_THRESHOLD_BTC

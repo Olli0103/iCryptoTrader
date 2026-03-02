@@ -139,6 +139,13 @@ class Disposal:
     exchange_order_id: str = ""
     exchange_trade_id: str = ""
 
+    # Splinter index: when a single exchange trade crosses tax-lot boundaries
+    # (e.g., 0.6 BTC from a tax-free lot + 0.4 BTC from a taxable lot),
+    # each resulting Disposal gets a sequential index (0, 1, ...) so German
+    # Finanzamt software can distinguish the sub-transactions under one
+    # exchange_trade_id.  -1 means unsplit (single lot consumed).
+    splinter_index: int = -1
+
 
 class FIFOLedger:
     """FIFO-ordered ledger of all BTC lots.
@@ -245,6 +252,7 @@ class FIFOLedger:
         ts = sale_timestamp or datetime.now(UTC)
         remaining_to_sell = quantity_btc
         disposals: list[Disposal] = []
+        splinter_idx = 0
 
         for lot in self._lots:
             if remaining_to_sell <= 0:
@@ -282,6 +290,7 @@ class FIFOLedger:
                 days_held_at_disposal=lot.days_held,
                 exchange_order_id=exchange_order_id,
                 exchange_trade_id=exchange_trade_id,
+                splinter_index=splinter_idx,
             )
 
             lot.remaining_qty_btc -= sell_from_lot
@@ -292,6 +301,7 @@ class FIFOLedger:
             lot.disposals.append(disposal)
             disposals.append(disposal)
             remaining_to_sell -= sell_from_lot
+            splinter_idx += 1
 
         self._invalidate_cache()
         total_gain = sum(d.gain_loss_eur for d in disposals)
