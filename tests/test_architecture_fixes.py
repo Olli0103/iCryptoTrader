@@ -7,6 +7,9 @@ Covers:
   4. Post-only rejection backoff
   5. Dead-band tolerance in InventoryArbiter
   6. CRC32 checksum auto-recovery in BookManager
+  7. Disconnect phantom-fill (synthetic fill on reconcile)
+  8. Partial-fill top-up loop prevention
+  9. Rate limiter server-ack drift protection
 """
 
 from __future__ import annotations
@@ -768,3 +771,257 @@ class TestBookAutoRecovery:
 
         book.request_resync()
         assert book.resync_count == 2
+
+
+# =============================================================================
+# 7. Disconnect Phantom-Fill (Synthetic Fill on Reconcile)
+# =============================================================================
+
+
+class TestDisconnectPhantomFill:
+    def _make_om_with_live_slot(
+        self, order_id: str = "O1", qty: str = "0.10",
+    ) -> tuple[OrderManager, OrderSlot]:
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        action = Action.AddOrder(Decimal("85000"), Decimal(qty), Side.BUY)
+        cmd = om.prepare_add(slot, action)
+        om.on_add_order_ack(
+            req_id=cmd["req_id"], order_id=order_id, success=True,
+        )
+        assert slot.state == SlotState.LIVE
+        return om, slot
+
+    def test_synthetic_fill_fired_on_reconcile(self) -> None:
+        """When snapshot shows more filled qty, synthetic fills must fire."""
+        om, slot = self._make_om_with_live_slot()
+        fills: list[dict] = []
+        om.on_fill(lambda s, d: fills.append(d))
+
+        # Snapshot shows 0.05 BTC filled while we were disconnected
+        om.reconcile_snapshot(
+            open_orders=[{
+                "order_id": "O1",
+                "limit_price": "85000",
+                "order_qty": "0.10",
+                "filled_qty": "0.05",
+            }],
+            recent_trades=[{
+                "order_id": "O1",
+                "qty": "0.05",
+                "price": "84990",
+                "fee": "0.12",
+                "trade_id": "T999",
+            }],
+        )
+
+        assert len(fills) == 1
+        assert fills[0]["last_qty"] == "0.05"
+        assert fills[0]["last_price"] == "84990"
+        assert fills[0]["fee"] == "0.12"
+        assert fills[0]["synthetic"] is True
+
+    def test_no_synthetic_fill_when_qty_unchanged(self) -> None:
+        """If snapshot filled_qty matches local, no synthetic fill."""
+        om, slot = self._make_om_with_live_slot()
+        fills: list[dict] = []
+        om.on_fill(lambda s, d: fills.append(d))
+
+        om.reconcile_snapshot(
+            open_orders=[{
+                "order_id": "O1",
+                "limit_price": "85000",
+                "order_qty": "0.10",
+                "filled_qty": "0",
+            }],
+            recent_trades=[],
+        )
+
+        assert len(fills) == 0
+
+    def test_synthetic_fill_uses_fallback_price(self) -> None:
+        """When no matching trades, use the order limit price as fallback."""
+        om, slot = self._make_om_with_live_slot()
+        fills: list[dict] = []
+        om.on_fill(lambda s, d: fills.append(d))
+
+        om.reconcile_snapshot(
+            open_orders=[{
+                "order_id": "O1",
+                "limit_price": "85000",
+                "order_qty": "0.10",
+                "filled_qty": "0.03",
+            }],
+            recent_trades=[],  # No trade data available
+        )
+
+        assert len(fills) == 1
+        assert fills[0]["last_qty"] == "0.03"
+        assert fills[0]["last_price"] == "85000"  # Fallback to limit price
+
+    def test_multiple_trades_reconstructed(self) -> None:
+        """Multiple trades during disconnect should each fire a callback."""
+        om, slot = self._make_om_with_live_slot()
+        fills: list[dict] = []
+        om.on_fill(lambda s, d: fills.append(d))
+
+        om.reconcile_snapshot(
+            open_orders=[{
+                "order_id": "O1",
+                "limit_price": "85000",
+                "order_qty": "0.10",
+                "filled_qty": "0.07",
+            }],
+            recent_trades=[
+                {"order_id": "O1", "qty": "0.04", "price": "84990", "fee": "0.10", "trade_id": "T1"},
+                {"order_id": "O1", "qty": "0.03", "price": "85010", "fee": "0.08", "trade_id": "T2"},
+            ],
+        )
+
+        assert len(fills) == 2
+        assert fills[0]["last_qty"] == "0.04"
+        assert fills[0]["last_price"] == "84990"
+        assert fills[1]["last_qty"] == "0.03"
+        assert fills[1]["last_price"] == "85010"
+
+    def test_disappeared_order_fires_fill_from_trades(self) -> None:
+        """If an order is gone from snapshot and has trades, fire fills."""
+        om, slot = self._make_om_with_live_slot(order_id="O2", qty="0.05")
+        fills: list[dict] = []
+        om.on_fill(lambda s, d: fills.append(d))
+
+        # Order O2 is NOT in the snapshot (fully filled or cancelled during disconnect)
+        om.reconcile_snapshot(
+            open_orders=[],
+            recent_trades=[
+                {"order_id": "O2", "qty": "0.05", "price": "85100", "fee": "0.13", "trade_id": "T5"},
+            ],
+        )
+
+        assert slot.state == SlotState.EMPTY
+        assert len(fills) == 1
+        assert fills[0]["last_qty"] == "0.05"
+
+    def test_slot_updated_after_synthetic_fill(self) -> None:
+        """Slot filled_qty should be updated from the snapshot."""
+        om, slot = self._make_om_with_live_slot()
+        om.on_fill(lambda s, d: None)
+
+        om.reconcile_snapshot(
+            open_orders=[{
+                "order_id": "O1",
+                "limit_price": "85000",
+                "order_qty": "0.10",
+                "filled_qty": "0.06",
+            }],
+            recent_trades=[],
+        )
+
+        assert slot.filled_qty == Decimal("0.06")
+
+
+# =============================================================================
+# 8. Partial-Fill Top-Up Loop Prevention
+# =============================================================================
+
+
+class TestPartialFillTopUpLoop:
+    def test_no_amend_after_partial_fill_same_desired(self) -> None:
+        """After a partial fill, if desired qty hasn't changed, no amend."""
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        action = Action.AddOrder(Decimal("85000"), Decimal("0.10"), Side.BUY)
+        cmd = om.prepare_add(slot, action)
+        om.on_add_order_ack(req_id=cmd["req_id"], order_id="O1", success=True)
+        assert slot.state == SlotState.LIVE
+
+        # Simulate partial fill: 0.03 of 0.10 filled
+        slot.filled_qty = Decimal("0.03")
+        # remaining_qty = 0.07, but slot.qty is still 0.10
+
+        # Strategy still wants the same level: qty=0.10
+        desired = _desired("85000", "0.10")
+        result = om.decide_action(slot, desired)
+
+        # Should NOT amend — slot.qty (0.10) == desired.qty (0.10)
+        assert isinstance(result, Action.Noop)
+
+    def test_amend_when_desired_qty_actually_changes(self) -> None:
+        """If the desired qty genuinely changes, amend should still work."""
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        action = Action.AddOrder(Decimal("85000"), Decimal("0.10"), Side.BUY)
+        cmd = om.prepare_add(slot, action)
+        om.on_add_order_ack(req_id=cmd["req_id"], order_id="O1", success=True)
+
+        # Desired qty changes from 0.10 to 0.15 (auto-compound kicked in)
+        desired = _desired("85000", "0.15")
+        result = om.decide_action(slot, desired)
+
+        assert isinstance(result, Action.AmendOrder)
+
+    def test_old_logic_would_have_amended(self) -> None:
+        """Verify that remaining_qty != desired.qty after partial fill."""
+        om = OrderManager(num_slots=1)
+        slot = om.slots[0]
+        action = Action.AddOrder(Decimal("85000"), Decimal("0.10"), Side.BUY)
+        cmd = om.prepare_add(slot, action)
+        om.on_add_order_ack(req_id=cmd["req_id"], order_id="O1", success=True)
+
+        slot.filled_qty = Decimal("0.04")
+        # remaining = 0.06, desired = 0.10 → old code would detect qty_changed
+        assert slot.remaining_qty() == Decimal("0.06")
+        # But the fix compares slot.qty (0.10) vs desired (0.10) → no change
+        desired = _desired("85000", "0.10")
+        result = om.decide_action(slot, desired)
+        assert isinstance(result, Action.Noop)
+
+
+# =============================================================================
+# 9. Rate Limiter Server-Ack Drift Protection
+# =============================================================================
+
+
+class TestRateLimiterDrift:
+    def test_higher_server_count_accepted(self) -> None:
+        """If server reports higher count, local should update."""
+        rl = RateLimiter(max_counter=180, decay_rate=0.0)
+        rl.record_send(10.0)  # Local estimate = 10
+        rl.update_from_server(50.0)  # Server says 50 (more restrictive)
+        assert rl.estimated_count >= 50.0
+
+    def test_lower_server_count_ignored(self) -> None:
+        """If server reports lower count, local should NOT drop."""
+        rl = RateLimiter(max_counter=180, decay_rate=0.0)
+        rl.record_send(50.0)  # Local estimate = 50
+
+        # Server says 10 (stale event) — should be ignored
+        rl.update_from_server(10.0)
+        assert rl.estimated_count >= 50.0  # Stays at our conservative estimate
+
+    def test_equal_server_count_accepted(self) -> None:
+        """If server reports the same count, should accept."""
+        rl = RateLimiter(max_counter=180, decay_rate=0.0)
+        rl.record_send(30.0)
+        rl.update_from_server(30.0)
+        assert rl.estimated_count >= 30.0
+
+    def test_drift_protection_prevents_burst(self) -> None:
+        """After ignoring stale low server count, headroom should stay tight."""
+        rl = RateLimiter(max_counter=180, decay_rate=0.0, headroom_pct=0.80)
+        # threshold = 180 * 0.80 = 144
+
+        # Local estimate near threshold
+        rl.record_send(140.0)
+        assert not rl.can_send(5.0)  # 140 + 5 = 145 > 144 threshold
+
+        # Stale server event says 10 — should NOT reset counter
+        rl.update_from_server(10.0)
+        assert not rl.can_send(5.0)  # Still throttled
+
+    def test_authoritative_count_always_stored(self) -> None:
+        """_authoritative_count should always reflect the latest server value."""
+        rl = RateLimiter(max_counter=180, decay_rate=0.0)
+        rl.record_send(50.0)
+        rl.update_from_server(10.0)  # Lower, ignored for estimate
+        assert rl._authoritative_count == 10.0  # But stored for reference
