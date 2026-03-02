@@ -231,6 +231,29 @@ class WSPrivate:
             return None
         return req_id
 
+    async def send_batch_add(
+        self,
+        orders: list[dict[str, object]],
+    ) -> int | None:
+        """Send batch_add command for multiple orders in one frame.
+
+        Kraken WS v2 batch_add sends up to 15 orders per frame,
+        consuming only 1 rate-limit counter increment instead of N.
+
+        Args:
+            orders: List of order dicts, each with order_type, side,
+                    symbol, limit_price, order_qty, cl_ord_id, post_only.
+
+        Returns req_id, or None if send failed.
+        """
+        if not orders:
+            return None
+        req_id = self.next_req_id()
+        frame = ws_codec.encode_batch_add(orders, req_id=req_id)
+        if not await self.send(frame):
+            return None
+        return req_id
+
     async def send_cancel_after(self, timeout_sec: int) -> int | None:
         """Send cancel_after (dead man's switch). timeout=0 disarms.
 

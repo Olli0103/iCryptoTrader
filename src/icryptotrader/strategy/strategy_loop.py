@@ -52,7 +52,9 @@ from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: 
 from icryptotrader.order.order_manager import Action, DesiredLevel, OrderManager
 from icryptotrader.risk.delta_skew import DeltaSkew  # noqa: TC001
 from icryptotrader.risk.hedge_manager import HedgeAction  # noqa: TC001
+from icryptotrader.risk.mark_out_tracker import MarkOutTracker
 from icryptotrader.risk.risk_manager import RiskManager  # noqa: TC001
+from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
 from icryptotrader.strategy.grid_engine import GridEngine  # noqa: TC001
 from icryptotrader.strategy.regime_router import RegimeRouter  # noqa: TC001
 from icryptotrader.tax.fifo_ledger import FIFOLedger  # noqa: TC001
@@ -90,6 +92,14 @@ class StrategyLoop:
     # At 1 sample/sec, maxlen=3600 covers exactly 1 hour and
     # maxlen=86400 covers exactly 24 hours regardless of tick rate.
     _PRICE_HISTORY_SAMPLE_SEC = 1.0
+
+    # Cross-connection heartbeat: if WS1 book hasn't been updated in this
+    # many seconds, we consider the public feed stale and issue emergency
+    # cancel_all to protect against trading on outdated market data.
+    _WS1_STALE_THRESHOLD_SEC = 2.5
+
+    # Maximum orders per batch_add frame (Kraken WS v2 limit).
+    _MAX_BATCH_SIZE = 15
 
     def __init__(
         self,
@@ -147,6 +157,16 @@ class StrategyLoop:
         self._compound_base_usd = compound_base_usd
         self._base_order_size_usd = base_order_size_usd
 
+        # Trade Flow Imbalance: tracks taker buy/sell volume from public trades.
+        # More resistant to L2 spoofing than naive OBI from resting book levels.
+        self._tfi = TradeFlowImbalance()
+
+        # Mark-out tracker: measures adverse selection at T+1s/T+10s/T+60s.
+        self._mark_out = MarkOutTracker()
+
+        # Cross-connection heartbeat: tracks whether WS1 data is stale.
+        self._ws1_stale_cancel_sent = False
+
         # Debounced ledger persistence: single-thread executor + dirty flag.
         # Prevents thread-pool starvation during burst fills (flash crashes
         # can produce 50-100 fills in seconds, each of which triggers a save).
@@ -181,6 +201,25 @@ class StrategyLoop:
         self.fills_today: int = 0
         self.profit_today_usd: Decimal = Decimal("0")
         self._start_time = time.time()
+
+    @property
+    def tfi(self) -> TradeFlowImbalance:
+        """Trade Flow Imbalance tracker (for external wiring)."""
+        return self._tfi
+
+    @property
+    def mark_out_tracker(self) -> MarkOutTracker:
+        """Mark-out tracker (for external wiring)."""
+        return self._mark_out
+
+    def record_public_trade(
+        self, side: str, qty: Decimal, price: Decimal,
+    ) -> None:
+        """Record a public trade from the Kraken trade channel.
+
+        Called by the __main__ trade callback to feed the TFI tracker.
+        """
+        self._tfi.record_trade(side=side, qty=qty, price=price)
 
     def set_eur_usd_rate(self, rate: Decimal) -> None:
         """Update EUR/USD rate from ECB service."""
@@ -288,6 +327,34 @@ class StrategyLoop:
         self.ticks += 1
         commands: list[dict[str, Any]] = []
 
+        # 0. Cross-connection heartbeat: if WS1 book data is stale, emergency
+        # cancel all orders and enter risk pause.  Trading on stale book data
+        # means our grid levels are anchored to an outdated mid-price while
+        # the real market may have moved significantly.
+        if self._book is not None and self._book.last_update_ts > 0:
+            ws1_age = tick_start - self._book.last_update_ts
+            if ws1_age > self._WS1_STALE_THRESHOLD_SEC:
+                if not self._ws1_stale_cancel_sent:
+                    logger.warning(
+                        "WS1 stale (%.1fs since last update) — "
+                        "issuing cancel_all and entering RISK_PAUSE",
+                        ws1_age,
+                    )
+                    commands.append({"type": "cancel_all", "slot_id": -1, "params": {}})
+                    self._risk.force_risk_pause()
+                    self._ws1_stale_cancel_sent = True
+                self.last_tick_duration_ms = (tick_start - tick_start) * 1000
+                self._record_tick_metrics()
+                return commands
+            elif self._ws1_stale_cancel_sent:
+                # WS1 recovered — clear the stale flag
+                logger.info("WS1 recovered (age=%.1fs), resuming", ws1_age)
+                self._ws1_stale_cancel_sent = False
+
+        # 0b. Mark-out tracker: check pending fills for T+X price marks.
+        if self._book is not None and self._book.is_valid:
+            self._mark_out.check_mark_outs(self._book.mid_price)
+
         # 1. Update market data
         self._inv.update_price(mid_price)
         self._regime.update_price(mid_price)
@@ -361,28 +428,40 @@ class StrategyLoop:
             num_sell = num_sell + self._hedge_action.sell_level_boost
             sell_spacing_tighten = self._hedge_action.sell_spacing_tighten_pct
 
-        # 7. Compute delta skew (with OBI from book if available)
+        # 7. Compute delta skew with blended microstructure signal.
+        # Trade Flow Imbalance (TFI) from executed trades is more reliable
+        # than naive L2 OBI which can be spoofed with phantom orders.
+        # Blend: 70% TFI (unfakeable) + 30% OBI (faster reaction).
         # Dead-band: when allocation drift is within tolerance (±2%), suppress
         # the allocation-based skew to avoid constantly fighting trivial drift.
-        # OBI-based skew still applies (microstructure signal is always useful).
         limits = self._inv.current_limits()
         obi = 0.0
+        tfi = self._tfi.compute()
         if self._book is not None and self._book.is_valid:
             obi = self._book.order_book_imbalance()
-            self._regime.update_order_book_imbalance(obi)
+
+        # Blend TFI and OBI for a spoof-resistant microstructure signal.
+        # TFI dominates when trades are flowing; OBI fills in during quiet
+        # periods when trade stream is sparse.
+        if self._tfi.trade_count > 0:
+            blended_signal = 0.7 * tfi + 0.3 * obi
+        else:
+            blended_signal = obi  # No trades yet — fall back to OBI
+
+        self._regime.update_order_book_imbalance(blended_signal)
 
         if self._inv.is_within_dead_band():
-            # Within dead-band: zero out allocation deviation, keep OBI only
+            # Within dead-band: zero out allocation deviation, keep signal only
             skew_result = self._skew.compute(
                 btc_alloc_pct=limits.target_pct,  # pretend we're at target
                 target_pct=limits.target_pct,
-                obi=obi,
+                obi=blended_signal,
             )
         else:
             skew_result = self._skew.compute(
                 btc_alloc_pct=snap.btc_allocation_pct,
                 target_pct=limits.target_pct,
-                obi=obi,
+                obi=blended_signal,
             )
 
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
@@ -502,10 +581,50 @@ class StrategyLoop:
             if cmd is not None:
                 commands.append(cmd)
 
+        # 11. Aggregate add commands into batch_add frames to reduce
+        # rate limit consumption. Kraken WS v2 batch_add sends up to 15
+        # orders per frame at the cost of 1 rate-limit counter increment.
+        commands = self._aggregate_batch_adds(commands)
+
         self.commands_issued += len(commands)
         self.last_tick_duration_ms = (time.monotonic() - tick_start) * 1000
         self._record_tick_metrics()
         return commands
+
+    def _aggregate_batch_adds(
+        self, commands: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Aggregate individual add commands into batch_add frames.
+
+        Kraken WS v2 batch_add sends up to 15 orders per frame,
+        consuming only 1 rate-limit counter increment instead of N.
+        Amend and cancel commands pass through unchanged.
+        """
+        adds: list[dict[str, Any]] = []
+        others: list[dict[str, Any]] = []
+
+        for cmd in commands:
+            if cmd.get("type") == "add":
+                adds.append(cmd)
+            else:
+                others.append(cmd)
+
+        if len(adds) <= 1:
+            return commands  # No batching benefit for 0-1 adds
+
+        # Split adds into chunks of _MAX_BATCH_SIZE
+        result = list(others)
+        for i in range(0, len(adds), self._MAX_BATCH_SIZE):
+            chunk = adds[i : i + self._MAX_BATCH_SIZE]
+            batch_orders = [cmd["params"] for cmd in chunk]
+            slot_ids = [cmd["slot_id"] for cmd in chunk]
+            result.append({
+                "type": "batch_add",
+                "slot_ids": slot_ids,
+                "params": {"orders": batch_orders},
+            })
+
+        return result
 
     def on_fill(self, slot: Any, fill_data: dict[str, Any]) -> None:
         """Handle a fill event — update FIFO ledger.
@@ -553,6 +672,21 @@ class StrategyLoop:
                 )
                 self._risk.force_risk_pause()
 
+        # Record fill for T+X mark-out tracking (adverse selection measurement).
+        # Uses the book mid-price at fill time as the T+0 reference.
+        if side is not None and fill_price > 0:
+            mid = (
+                self._book.mid_price
+                if self._book is not None and self._book.is_valid
+                else fill_price
+            )
+            self._mark_out.record_fill(
+                fill_price=fill_price,
+                side=side.value,
+                qty=fill_qty,
+                mid_price=mid,
+            )
+
         # Record fill in metrics
         if self._metrics:
             side_label = side.value if side else "unknown"
@@ -581,6 +715,8 @@ class StrategyLoop:
             "book_imbalance": self._book.order_book_imbalance()
             if self._book and self._book.is_valid
             else 0.0,
+            "trade_flow_imbalance": self._tfi.compute(),
+            "adverse_selection_bps": self._mark_out.stats().suggested_adverse_bps,
             "ytd_taxable_gain_eur": float(self._ledger.taxable_gain_ytd()),
         }
 

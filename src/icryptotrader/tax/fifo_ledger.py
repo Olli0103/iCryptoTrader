@@ -23,7 +23,33 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Approximate holding period in days (used for informational display only).
+# For actual tax decisions, use _one_year_after() which handles leap years.
 HOLDING_PERIOD_DAYS = 365
+
+# Safety buffer: German tax uses CET/CEST but our timestamps are UTC,
+# creating up to 2 hours of drift across timezone boundaries.  Adding
+# 1 day ensures we never sell a lot that hasn't fully cleared the
+# holding period in CET.
+_TAX_SAFETY_BUFFER = timedelta(days=1)
+
+
+def _one_year_after(dt: datetime) -> datetime:
+    """Compute the date exactly one calendar year after ``dt``.
+
+    German §23 EStG uses "one year" (1 Jahr) per BGB §188, meaning the
+    same calendar date the following year.  This handles leap years:
+      - 2024-02-29 + 1 year → 2025-02-28 (Feb 29 doesn't exist in 2025)
+      - 2024-03-01 + 1 year → 2025-03-01 (366 days, not 365)
+
+    Adds a 1-day safety buffer for UTC→CET timezone drift.
+    """
+    try:
+        anniversary = dt.replace(year=dt.year + 1)
+    except ValueError:
+        # Feb 29 in a leap year → Feb 28 in the next non-leap year
+        anniversary = dt.replace(year=dt.year + 1, month=2, day=28)
+    return anniversary + _TAX_SAFETY_BUFFER
 
 
 @dataclass
@@ -69,11 +95,13 @@ class TaxLot:
 
     @property
     def is_tax_free(self) -> bool:
-        return self.days_held >= HOLDING_PERIOD_DAYS
+        """Whether this lot has exceeded the §23 EStG 1-year holding period."""
+        return datetime.now(UTC) >= self.tax_free_date
 
     @property
     def tax_free_date(self) -> datetime:
-        return self.purchase_timestamp + timedelta(days=HOLDING_PERIOD_DAYS)
+        """Date when this lot becomes tax-free (1 calendar year + safety buffer)."""
+        return _one_year_after(self.purchase_timestamp)
 
     @property
     def cost_basis_per_btc_eur(self) -> Decimal:
@@ -296,12 +324,17 @@ class FIFOLedger:
         return float(self.tax_free_btc() / total)
 
     def days_until_next_free(self) -> int | None:
-        """Days until the next locked lot becomes tax-free. None if all free or empty."""
+        """Days until the next locked lot becomes tax-free. None if all free or empty.
+
+        Uses calendar-year holding period (not fixed 365 days) to handle
+        leap years correctly.
+        """
+        now = datetime.now(UTC)
         min_days: int | None = None
         for lot in self._lots:
             if lot.status == LotStatus.CLOSED or lot.is_tax_free:
                 continue
-            days_left = HOLDING_PERIOD_DAYS - lot.days_held
+            days_left = (lot.tax_free_date - now).days
             if days_left > 0 and (min_days is None or days_left < min_days):
                 min_days = days_left
         return min_days

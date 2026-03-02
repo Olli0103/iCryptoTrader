@@ -13,11 +13,17 @@ Covers:
   10. Time-decimated price history deques
   11. Grid compression collision dedup
   12. WS auth token caching
+  13. Trade Flow Imbalance (TFI) — spoof-resistant microstructure signal
+  14. T+X Mark-Out tracking — adverse selection measurement
+  15. batch_add / batch_cancel — WS2 rate limit optimization
+  16. Cross-connection heartbeat — WS1 staleness monitor
+  17. Leap year / 366-day tax holding period fix
 """
 
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -1220,3 +1226,523 @@ class TestWSAuthTokenCaching:
         from icryptotrader.ws.ws_private import WSPrivate
         ws = WSPrivate()
         assert ws._token_ttl_sec == 780.0
+
+
+# =============================================================================
+# 13. Trade Flow Imbalance (TFI)
+# =============================================================================
+
+
+class TestTradeFlowImbalance:
+    def test_empty_returns_zero(self) -> None:
+        """TFI with no trades should return 0.0."""
+        from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
+        tfi = TradeFlowImbalance()
+        assert tfi.compute() == 0.0
+
+    def test_all_buys_returns_positive(self) -> None:
+        """All taker-buy trades should produce TFI close to +1.0."""
+        from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
+        t = [100.0]
+        tfi = TradeFlowImbalance(window_sec=60, half_life_sec=15, clock=lambda: t[0])
+        for _ in range(10):
+            tfi.record_trade("buy", Decimal("0.01"), Decimal("85000"))
+        assert tfi.compute() > 0.9
+
+    def test_all_sells_returns_negative(self) -> None:
+        """All taker-sell trades should produce TFI close to -1.0."""
+        from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
+        t = [100.0]
+        tfi = TradeFlowImbalance(window_sec=60, half_life_sec=15, clock=lambda: t[0])
+        for _ in range(10):
+            tfi.record_trade("sell", Decimal("0.01"), Decimal("85000"))
+        assert tfi.compute() < -0.9
+
+    def test_balanced_returns_near_zero(self) -> None:
+        """Equal buy and sell volume should produce TFI near 0."""
+        from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
+        t = [100.0]
+        tfi = TradeFlowImbalance(window_sec=60, half_life_sec=15, clock=lambda: t[0])
+        for _ in range(10):
+            tfi.record_trade("buy", Decimal("0.01"), Decimal("85000"))
+            tfi.record_trade("sell", Decimal("0.01"), Decimal("85000"))
+        assert abs(tfi.compute()) < 0.01
+
+    def test_recent_trades_weighted_more(self) -> None:
+        """Recent trades should have more influence than older ones."""
+        from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
+        t = [100.0]
+        tfi = TradeFlowImbalance(window_sec=60, half_life_sec=5, clock=lambda: t[0])
+        # Old sell trades
+        for _ in range(10):
+            tfi.record_trade("sell", Decimal("0.01"), Decimal("85000"))
+        # Advance time by 20 seconds (4 half-lives: weight ~1/16)
+        t[0] = 120.0
+        # Recent buy trades
+        for _ in range(5):
+            tfi.record_trade("buy", Decimal("0.01"), Decimal("85000"))
+        # Recent buys should dominate despite fewer trades
+        assert tfi.compute() > 0.3
+
+    def test_expired_trades_pruned(self) -> None:
+        """Trades older than window_sec should be pruned."""
+        from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
+        t = [100.0]
+        tfi = TradeFlowImbalance(window_sec=30, half_life_sec=10, clock=lambda: t[0])
+        tfi.record_trade("buy", Decimal("1.0"), Decimal("85000"))
+        t[0] = 140.0  # 40 seconds later (beyond 30s window)
+        tfi.record_trade("sell", Decimal("0.01"), Decimal("85000"))
+        # The old buy should be pruned; only the small sell remains
+        assert tfi.compute() < -0.9
+
+    def test_trade_count_reflects_window(self) -> None:
+        """trade_count should only include non-expired trades."""
+        from icryptotrader.risk.trade_flow_imbalance import TradeFlowImbalance
+        t = [100.0]
+        tfi = TradeFlowImbalance(window_sec=10, half_life_sec=5, clock=lambda: t[0])
+        tfi.record_trade("buy", Decimal("0.01"), Decimal("85000"))
+        assert tfi.trade_count == 1
+        t[0] = 115.0  # After window expires
+        tfi.compute()  # Triggers pruning
+        assert tfi.trade_count == 0
+
+
+# =============================================================================
+# 14. T+X Mark-Out Tracking
+# =============================================================================
+
+
+class TestMarkOutTracking:
+    def test_record_and_check(self) -> None:
+        """Mark-out should record fill and check at T+1s."""
+        from icryptotrader.risk.mark_out_tracker import MarkOutTracker
+        t = [100.0]
+        tracker = MarkOutTracker(clock=lambda: t[0])
+        tracker.record_fill(
+            fill_price=Decimal("85000"), side="buy",
+            qty=Decimal("0.01"), mid_price=Decimal("85000"),
+        )
+        assert tracker.fills_tracked == 1
+        # Advance 1.1 seconds
+        t[0] = 101.1
+        tracker.check_mark_outs(current_mid=Decimal("84990"))
+        stats = tracker.stats()
+        assert stats.observations.get(1.0, 0) == 1
+
+    def test_buy_adverse_selection_positive(self) -> None:
+        """Buying at 85000 when mid drops to 84000 should show adverse selection."""
+        from icryptotrader.risk.mark_out_tracker import MarkOutTracker
+        t = [100.0]
+        tracker = MarkOutTracker(clock=lambda: t[0])
+        tracker.record_fill(
+            fill_price=Decimal("85000"), side="buy",
+            qty=Decimal("0.01"), mid_price=Decimal("85000"),
+        )
+        # Advance past all horizons
+        t[0] = 161.0
+        tracker.check_mark_outs(current_mid=Decimal("84000"))
+        stats = tracker.stats()
+        # Adverse = (85000 - 84000) / 85000 * 10000 ≈ 117.6 bps
+        assert stats.avg_adverse_bps[1.0] > 100
+
+    def test_sell_adverse_selection_positive(self) -> None:
+        """Selling at 85000 when mid rises to 86000 should show adverse selection."""
+        from icryptotrader.risk.mark_out_tracker import MarkOutTracker
+        t = [100.0]
+        tracker = MarkOutTracker(clock=lambda: t[0])
+        tracker.record_fill(
+            fill_price=Decimal("85000"), side="sell",
+            qty=Decimal("0.01"), mid_price=Decimal("85000"),
+        )
+        t[0] = 161.0
+        tracker.check_mark_outs(current_mid=Decimal("86000"))
+        stats = tracker.stats()
+        # Adverse = (86000 - 85000) / 85000 * 10000 ≈ 117.6 bps
+        assert stats.avg_adverse_bps[1.0] > 100
+
+    def test_favorable_fill_negative_adverse(self) -> None:
+        """Buying at 85000 when mid rises to 86000 should be favorable (negative)."""
+        from icryptotrader.risk.mark_out_tracker import MarkOutTracker
+        t = [100.0]
+        tracker = MarkOutTracker(clock=lambda: t[0])
+        tracker.record_fill(
+            fill_price=Decimal("85000"), side="buy",
+            qty=Decimal("0.01"), mid_price=Decimal("85000"),
+        )
+        t[0] = 161.0
+        tracker.check_mark_outs(current_mid=Decimal("86000"))
+        stats = tracker.stats()
+        # Favorable = (85000 - 86000) / 85000 * 10000 ≈ -117.6 bps
+        assert stats.avg_adverse_bps[1.0] < -100
+
+    def test_suggested_adverse_bps_clamped(self) -> None:
+        """suggested_adverse_bps should be clamped to [1, 50]."""
+        from icryptotrader.risk.mark_out_tracker import MarkOutTracker
+        tracker = MarkOutTracker()
+        # No data: should return 1.0 (minimum clamp)
+        stats = tracker.stats()
+        assert stats.suggested_adverse_bps == 1.0
+
+    def test_multiple_horizons_measured(self) -> None:
+        """All three horizons (1s, 10s, 60s) should be measured."""
+        from icryptotrader.risk.mark_out_tracker import MarkOutTracker
+        t = [100.0]
+        tracker = MarkOutTracker(clock=lambda: t[0])
+        tracker.record_fill(
+            fill_price=Decimal("85000"), side="buy",
+            qty=Decimal("0.01"), mid_price=Decimal("85000"),
+        )
+        # Check at T+1.5s
+        t[0] = 101.5
+        tracker.check_mark_outs(current_mid=Decimal("85010"))
+        assert tracker.stats().observations[1.0] == 1
+        assert tracker.stats().observations[10.0] == 0
+        # Check at T+11s
+        t[0] = 111.0
+        tracker.check_mark_outs(current_mid=Decimal("85020"))
+        assert tracker.stats().observations[10.0] == 1
+        # Check at T+61s
+        t[0] = 161.0
+        tracker.check_mark_outs(current_mid=Decimal("85030"))
+        assert tracker.stats().observations[60.0] == 1
+
+
+# =============================================================================
+# 15. batch_add / batch_cancel Encoding
+# =============================================================================
+
+
+class TestBatchAddEncoding:
+    def test_encode_batch_add_single_order(self) -> None:
+        """batch_add with a single order should encode correctly."""
+        import orjson
+        from icryptotrader.ws.ws_codec import encode_batch_add
+        orders = [{"order_type": "limit", "side": "buy", "symbol": "XBT/USD",
+                    "limit_price": "85000", "order_qty": "0.01"}]
+        frame = encode_batch_add(orders, req_id=42)
+        decoded = orjson.loads(frame)
+        assert decoded["method"] == "batch_add"
+        assert decoded["req_id"] == 42
+        assert len(decoded["params"]["orders"]) == 1
+
+    def test_encode_batch_add_multiple_orders(self) -> None:
+        """batch_add with multiple orders should include all of them."""
+        import orjson
+        from icryptotrader.ws.ws_codec import encode_batch_add
+        orders = [
+            {"order_type": "limit", "side": "buy", "symbol": "XBT/USD",
+             "limit_price": str(85000 - i * 100), "order_qty": "0.01"}
+            for i in range(5)
+        ]
+        frame = encode_batch_add(orders, req_id=99)
+        decoded = orjson.loads(frame)
+        assert len(decoded["params"]["orders"]) == 5
+
+    def test_encode_batch_cancel(self) -> None:
+        """batch cancel should encode a list of order IDs."""
+        import orjson
+        from icryptotrader.ws.ws_codec import encode_batch_cancel
+        ids = ["O1", "O2", "O3"]
+        frame = encode_batch_cancel(ids, req_id=50)
+        decoded = orjson.loads(frame)
+        assert decoded["method"] == "cancel_order"
+        assert decoded["params"]["order_id"] == ["O1", "O2", "O3"]
+
+    def test_aggregate_batch_adds_no_adds(self) -> None:
+        """No add commands → commands unchanged."""
+        loop = _make_loop()
+        commands = [
+            {"type": "cancel", "slot_id": 0, "params": {"order_id": "O1"}},
+            {"type": "amend", "slot_id": 1, "params": {"order_id": "O2"}},
+        ]
+        result = loop._aggregate_batch_adds(commands)
+        assert result == commands
+
+    def test_aggregate_batch_adds_single_add(self) -> None:
+        """Single add command → no batching."""
+        loop = _make_loop()
+        commands = [
+            {"type": "add", "slot_id": 0, "params": {"order_type": "limit"}},
+        ]
+        result = loop._aggregate_batch_adds(commands)
+        assert result == commands
+
+    def test_aggregate_batch_adds_multiple_adds(self) -> None:
+        """Multiple add commands → aggregated into batch_add."""
+        loop = _make_loop()
+        commands = [
+            {"type": "add", "slot_id": 0, "params": {"order_type": "limit", "side": "buy"}},
+            {"type": "amend", "slot_id": 2, "params": {"order_id": "O2"}},
+            {"type": "add", "slot_id": 1, "params": {"order_type": "limit", "side": "sell"}},
+            {"type": "add", "slot_id": 3, "params": {"order_type": "limit", "side": "buy"}},
+        ]
+        result = loop._aggregate_batch_adds(commands)
+        # Should have 1 amend + 1 batch_add
+        amends = [c for c in result if c["type"] == "amend"]
+        batches = [c for c in result if c["type"] == "batch_add"]
+        assert len(amends) == 1
+        assert len(batches) == 1
+        assert len(batches[0]["params"]["orders"]) == 3
+        assert batches[0]["slot_ids"] == [0, 1, 3]
+
+
+# =============================================================================
+# 16. Cross-Connection Heartbeat (WS1 Staleness)
+# =============================================================================
+
+
+class TestCrossConnectionHeartbeat:
+    def test_stale_ws1_triggers_cancel_all(self) -> None:
+        """When WS1 book is stale, tick should emit cancel_all command."""
+        book = OrderBook(symbol="XBT/USD")
+        # Apply a valid snapshot so book is valid
+        snapshot = {
+            "asks": [{"price": "85010.0", "qty": "1.0"}],
+            "bids": [{"price": "84990.0", "qty": "1.0"}],
+        }
+        book.apply_snapshot(snapshot, checksum_enabled=False)
+
+        # Simulate WS1 being stale: set last_update_ts to 5 seconds ago
+        import time as _time
+        book._last_update_ts = _time.monotonic() - 5.0
+
+        loop = _make_loop()
+        loop._book = book
+        commands = loop.tick(Decimal("85000"))
+
+        cancel_alls = [c for c in commands if c.get("type") == "cancel_all"]
+        assert len(cancel_alls) >= 1
+
+    def test_fresh_ws1_no_cancel_all(self) -> None:
+        """When WS1 is fresh, tick should NOT emit cancel_all."""
+        book = OrderBook(symbol="XBT/USD")
+        snapshot = {
+            "asks": [{"price": "85010.0", "qty": "1.0"}],
+            "bids": [{"price": "84990.0", "qty": "1.0"}],
+        }
+        book.apply_snapshot(snapshot, checksum_enabled=False)
+        # last_update_ts was set by apply_snapshot (just now)
+
+        loop = _make_loop()
+        loop._book = book
+        commands = loop.tick(Decimal("85000"))
+
+        cancel_alls = [c for c in commands if c.get("type") == "cancel_all"]
+        assert len(cancel_alls) == 0
+
+    def test_stale_cancel_sent_only_once(self) -> None:
+        """cancel_all should be sent only once until WS1 recovers."""
+        import time as _time
+        book = OrderBook(symbol="XBT/USD")
+        snapshot = {
+            "asks": [{"price": "85010.0", "qty": "1.0"}],
+            "bids": [{"price": "84990.0", "qty": "1.0"}],
+        }
+        book.apply_snapshot(snapshot, checksum_enabled=False)
+        book._last_update_ts = _time.monotonic() - 5.0
+
+        loop = _make_loop()
+        loop._book = book
+
+        commands1 = loop.tick(Decimal("85000"))
+        commands2 = loop.tick(Decimal("85000"))
+
+        cancel_all_1 = [c for c in commands1 if c.get("type") == "cancel_all"]
+        cancel_all_2 = [c for c in commands2 if c.get("type") == "cancel_all"]
+        assert len(cancel_all_1) == 1
+        assert len(cancel_all_2) == 0  # Already sent
+
+    def test_ws1_recovery_clears_stale_flag(self) -> None:
+        """After WS1 recovers, the stale flag should be cleared."""
+        import time as _time
+        book = OrderBook(symbol="XBT/USD")
+        snapshot = {
+            "asks": [{"price": "85010.0", "qty": "1.0"}],
+            "bids": [{"price": "84990.0", "qty": "1.0"}],
+        }
+        book.apply_snapshot(snapshot, checksum_enabled=False)
+        book._last_update_ts = _time.monotonic() - 5.0
+
+        loop = _make_loop()
+        loop._book = book
+
+        # First tick: stale
+        loop.tick(Decimal("85000"))
+        assert loop._ws1_stale_cancel_sent is True
+
+        # Simulate WS1 recovery
+        book._last_update_ts = _time.monotonic()
+        loop.tick(Decimal("85000"))
+        assert loop._ws1_stale_cancel_sent is False
+
+    def test_book_last_update_ts_set_on_snapshot(self) -> None:
+        """apply_snapshot should set last_update_ts."""
+        book = OrderBook(symbol="XBT/USD")
+        assert book.last_update_ts == 0.0
+        book.apply_snapshot(
+            {"asks": [{"price": "85010.0", "qty": "1.0"}],
+             "bids": [{"price": "84990.0", "qty": "1.0"}]},
+            checksum_enabled=False,
+        )
+        assert book.last_update_ts > 0.0
+
+    def test_book_last_update_ts_set_on_update(self) -> None:
+        """apply_update should set last_update_ts."""
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot(
+            {"asks": [{"price": "85010.0", "qty": "1.0"}],
+             "bids": [{"price": "84990.0", "qty": "1.0"}]},
+            checksum_enabled=False,
+        )
+        old_ts = book.last_update_ts
+        import time as _time
+        _time.sleep(0.01)  # Ensure monotonic advances
+        book.apply_update(
+            {"asks": [{"price": "85020.0", "qty": "0.5"}]},
+            checksum_enabled=False,
+        )
+        assert book.last_update_ts > old_ts
+
+
+# =============================================================================
+# 17. Leap Year / 366-Day Tax Holding Period
+# =============================================================================
+
+
+class TestLeapYearTaxHolding:
+    def test_one_year_after_normal_date(self) -> None:
+        """Normal date: 2025-03-01 + 1 year → 2026-03-02 (with safety buffer)."""
+        from icryptotrader.tax.fifo_ledger import _one_year_after
+        dt = datetime(2025, 3, 1, tzinfo=UTC)
+        result = _one_year_after(dt)
+        # 1 year = 2026-03-01, + 1 day buffer = 2026-03-02
+        assert result.year == 2026
+        assert result.month == 3
+        assert result.day == 2
+
+    def test_one_year_after_leap_day(self) -> None:
+        """Feb 29 in leap year → Feb 28 next year + 1 day buffer → Mar 1."""
+        from icryptotrader.tax.fifo_ledger import _one_year_after
+        dt = datetime(2024, 2, 29, tzinfo=UTC)
+        result = _one_year_after(dt)
+        # Feb 29 → Feb 28 (no Feb 29 in 2025) + 1 day buffer = Mar 1
+        assert result.year == 2025
+        assert result.month == 3
+        assert result.day == 1
+
+    def test_one_year_after_jan_1_leap_year(self) -> None:
+        """Jan 1 in leap year → Jan 1 next year + 1 day = Jan 2."""
+        from icryptotrader.tax.fifo_ledger import _one_year_after
+        dt = datetime(2024, 1, 1, tzinfo=UTC)
+        result = _one_year_after(dt)
+        assert result == datetime(2025, 1, 2, tzinfo=UTC)
+
+    def test_lot_bought_on_leap_day_holding_period(self) -> None:
+        """A lot bought Feb 29, 2024 should NOT be tax-free on Feb 28, 2025."""
+        from datetime import timedelta as td
+        ledger = FIFOLedger()
+        lot = ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("0"),
+            eur_usd_rate=Decimal("1.08"),
+            purchase_timestamp=datetime(2024, 2, 29, 12, 0, 0, tzinfo=UTC),
+        )
+        # On Feb 28, 2025: not yet free (need +1 day safety buffer = Mar 1)
+        # tax_free_date = Feb 28 + 1 day = Mar 1, 2025
+        assert lot.tax_free_date.year == 2025
+        assert lot.tax_free_date.month == 3
+        assert lot.tax_free_date.day == 1
+
+    def test_lot_bought_jan_15_leap_year_366_days(self) -> None:
+        """A lot bought Jan 15, 2024 (leap year): 1 calendar year later is Jan 15, 2025.
+
+        That span crosses Feb 29 2024, so it's 366 days (not 365).
+        The old ``timedelta(days=365)`` would give Jan 14 — 1 day early.
+        """
+        from icryptotrader.tax.fifo_ledger import _one_year_after
+        dt = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+        free_date = _one_year_after(dt)
+        # Calendar year: 2025-01-15, + 1 day buffer = 2025-01-16
+        assert free_date == datetime(2025, 1, 16, 12, 0, 0, tzinfo=UTC)
+        # The old timedelta(365) would give 2025-01-14 (366-day span → 1 day early)
+        old_free = dt + timedelta(days=365)
+        assert old_free.day == 14  # Jan 14, 2025 — wrong!
+        assert free_date > old_free  # Our fix is more conservative
+
+    def test_days_until_next_free_leap_year(self) -> None:
+        """days_until_next_free should use calendar-year computation."""
+        from datetime import timedelta as td
+        ledger = FIFOLedger()
+        # Lot purchased 350 days ago — the remaining days depend on
+        # whether a leap year is involved.
+        purchase_ts = datetime.now(UTC) - td(days=350)
+        ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("0"),
+            eur_usd_rate=Decimal("1.08"),
+            purchase_timestamp=purchase_ts,
+        )
+        days = ledger.days_until_next_free()
+        assert days is not None
+        # Should be > 0 (not yet free due to safety buffer)
+        assert days > 0
+        # Should be roughly 16-17 days (365-350=15 + 1-2 day buffer)
+        assert 14 <= days <= 19
+
+    def test_is_tax_free_uses_calendar_year(self) -> None:
+        """is_tax_free should use calendar year, not fixed 365 days."""
+        ledger = FIFOLedger()
+        # Purchased exactly 365 days ago — might not be free yet
+        # (depends on leap year + safety buffer)
+        purchase_ts = datetime.now(UTC) - timedelta(days=365)
+        lot = ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("0"),
+            eur_usd_rate=Decimal("1.08"),
+            purchase_timestamp=purchase_ts,
+        )
+        # With the 1-day safety buffer, a lot purchased exactly 365 days ago
+        # should NOT be tax-free yet (need 366+ days due to buffer)
+        assert not lot.is_tax_free
+
+    def test_old_lot_still_tax_free(self) -> None:
+        """A lot held for 400 days should definitely be tax-free."""
+        ledger = FIFOLedger()
+        lot = ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("0"),
+            eur_usd_rate=Decimal("1.08"),
+            purchase_timestamp=datetime.now(UTC) - timedelta(days=400),
+        )
+        assert lot.is_tax_free
+
+
+# =============================================================================
+# 18. TFI Integration in Strategy Loop
+# =============================================================================
+
+
+class TestTFIIntegration:
+    def test_strategy_loop_has_tfi(self) -> None:
+        """StrategyLoop should expose a TFI tracker."""
+        loop = _make_loop()
+        assert loop.tfi is not None
+        assert loop.tfi.compute() == 0.0
+
+    def test_record_public_trade_feeds_tfi(self) -> None:
+        """record_public_trade should feed the TFI tracker."""
+        loop = _make_loop()
+        loop.record_public_trade("buy", Decimal("0.01"), Decimal("85000"))
+        loop.record_public_trade("buy", Decimal("0.02"), Decimal("85000"))
+        assert loop.tfi.trade_count == 2
+        assert loop.tfi.compute() > 0.9  # All buys → positive
+
+    def test_mark_out_tracker_exists(self) -> None:
+        """StrategyLoop should expose a mark-out tracker."""
+        loop = _make_loop()
+        assert loop.mark_out_tracker is not None
+        assert loop.mark_out_tracker.fills_tracked == 0

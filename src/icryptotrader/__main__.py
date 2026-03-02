@@ -391,8 +391,19 @@ async def _run_bot(cfg: Config) -> None:
             order_book.apply_update(book_data)
         tick_event.set()
 
-    def _on_trade_msg(_msg: object) -> None:
-        """Signal tick on public trade."""
+    def _on_trade_msg(msg: object) -> None:
+        """Route public trade data to TFI tracker and signal tick."""
+        assert isinstance(msg, WSMessage)
+        for trade_data in msg.data:
+            side = trade_data.get("side", "")
+            qty_str = str(trade_data.get("qty", "0"))
+            price_str = str(trade_data.get("price", "0"))
+            if side and qty_str != "0":
+                strategy_loop.record_public_trade(
+                    side=side,
+                    qty=Decimal(qty_str),
+                    price=Decimal(price_str),
+                )
         tick_event.set()
 
     def _on_execution_msg(msg: object) -> None:
@@ -494,10 +505,14 @@ async def _run_bot(cfg: Config) -> None:
                         cmd_type = cmd.get("type")
                         if cmd_type == "add":
                             await ws_private.send_add_order(**params)
+                        elif cmd_type == "batch_add":
+                            await ws_private.send_batch_add(**params)
                         elif cmd_type == "amend":
                             await ws_private.send_amend_order(**params)
                         elif cmd_type == "cancel":
                             await ws_private.send_cancel_order(**params)
+                        elif cmd_type == "cancel_all":
+                            await ws_private.send_cancel_all()
             except Exception:
                 logger.exception("Tick error")
     except asyncio.CancelledError:

@@ -258,6 +258,57 @@ def encode_cancel_after(timeout_sec: int, req_id: int | None = None) -> bytes:
     return bytes(orjson.dumps(msg))
 
 
+def encode_batch_add(
+    orders: list[dict[str, Any]],
+    *,
+    req_id: int | None = None,
+) -> bytes:
+    """Encode a batch_add command for multiple orders in a single frame.
+
+    Each order dict should contain the same fields as a single add_order:
+      - order_type: "limit" (or "market")
+      - side: "buy" or "sell"
+      - symbol: e.g., "XBT/USD"
+      - limit_price: str (for limit orders)
+      - order_qty: str
+      - cl_ord_id: str (optional)
+      - post_only: bool (optional)
+
+    Kraken WS v2 batch_add sends up to 15 orders per frame,
+    consuming only 1 rate-limit counter increment instead of N.
+    """
+    msg: dict[str, Any] = {
+        "method": "batch_add",
+        "params": {"orders": orders},
+    }
+    if req_id is not None:
+        msg["req_id"] = req_id
+    return bytes(orjson.dumps(msg))
+
+
+def encode_batch_cancel(
+    order_ids: list[str],
+    *,
+    cl_ord_ids: list[str] | None = None,
+    req_id: int | None = None,
+) -> bytes:
+    """Encode a batch cancel command using cancel_order with a list of IDs.
+
+    Kraken's cancel_order already supports a list of order_id values.
+    This is a convenience wrapper that also supports cl_ord_id lists.
+    """
+    params: dict[str, Any] = {}
+    if order_ids:
+        params["order_id"] = order_ids
+    if cl_ord_ids:
+        params["cl_ord_id"] = cl_ord_ids
+
+    msg: dict[str, Any] = {"method": "cancel_order", "params": params}
+    if req_id is not None:
+        msg["req_id"] = req_id
+    return bytes(orjson.dumps(msg))
+
+
 def encode_ping(req_id: int | None = None) -> bytes:
     """Encode a ping message."""
     msg: dict[str, Any] = {"method": "ping"}

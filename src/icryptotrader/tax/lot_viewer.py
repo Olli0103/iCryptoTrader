@@ -177,5 +177,7 @@ def _lot_status_label(lot: TaxLot) -> str:
 
 def _days_until_free(lot: TaxLot) -> int:
     """Days until a lot becomes tax-free. 0 if already free."""
-    remaining = HOLDING_PERIOD_DAYS - lot.days_held
+    from datetime import UTC, datetime
+
+    remaining = (lot.tax_free_date - datetime.now(UTC)).days
     return max(0, remaining)
