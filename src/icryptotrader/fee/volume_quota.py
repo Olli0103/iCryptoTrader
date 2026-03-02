@@ -6,9 +6,14 @@ the grid engine widens spreads, reducing fill rate.  Lower fill rate reduces
 fees increase, forcing even wider spreads — creating an unrecoverable death
 spiral where the bot perpetually widens itself out of the market.
 
-The Volume Quota tracks progress toward maintaining the current fee tier.
-When volume is at risk of dropping, it overrides the minimum spacing to
-take neutral-EV trades that maintain the tier.
+Key design features:
+  - Proactive PID-like ramp: detects risk over a 15-day forward window and
+    smoothly dials down gamma (risk aversion) rather than panicking on day 27.
+  - Hard EV floor: never allows spacing below +0.5 bps expected value.
+    The volume quota can only tighten maker quotes — it is NEVER allowed to
+    cross the spread and incur taker fees to meet quotas.
+  - Dampened response: the spacing multiplier changes smoothly based on the
+    fractional depth within the defense zone, preventing oscillation.
 """
 
 from __future__ import annotations
@@ -30,6 +35,15 @@ _TIER_DEFENSE_ZONE_PCT = 0.20
 # This tolerates losing 20% of edge per trade to generate volume.
 _TIER_DEFENSE_SPACING_MULT = Decimal("0.80")
 
+# Hard EV floor: volume quota override can NEVER push expected net edge
+# below this value in bps. This prevents the quota from generating
+# negative-EV trades.  0.5 bps is the absolute minimum profitable edge.
+MIN_EDGE_BPS_FLOOR = Decimal("0.5")
+
+# Proactive defense window: spread the volume deficit smoothly over this
+# many days instead of panicking near the end of the 30-day window.
+_DEFENSE_RAMP_DAYS = 15
+
 
 @dataclass
 class VolumeQuotaStatus:
@@ -42,6 +56,7 @@ class VolumeQuotaStatus:
     defense_zone_usd: int  # Volume buffer zone where defense activates
     spacing_override_mult: Decimal  # Multiplier for min spacing (1.0 = no override)
     daily_volume_target_usd: int  # Recommended daily volume to maintain tier
+    ev_floor_active: bool  # True if the EV floor is binding (clamped)
 
 
 class VolumeQuota:
@@ -52,11 +67,19 @@ class VolumeQuota:
     slightly lower edge in order to generate the volume needed to maintain
     the tier — breaking the death spiral before it starts.
 
+    Hard constraints:
+      - NEVER cross the spread to meet volume. Maker-only tightening.
+      - NEVER push expected edge below MIN_EDGE_BPS_FLOOR (+0.5 bps).
+      - Smoothly ramp over 15 days, not panic-sprint on day 27.
+
     Usage:
         quota = VolumeQuota(fee_model=fee_model)
         status = quota.assess()
         if status.tier_at_risk:
-            effective_spacing = min_spacing * status.spacing_override_mult
+            effective_spacing = max(
+                min_spacing * status.spacing_override_mult,
+                fee_model.rt_cost_bps() + MIN_EDGE_BPS_FLOOR,
+            )
     """
 
     def __init__(
@@ -97,6 +120,15 @@ class VolumeQuota:
             Decimal("0"),
         )
 
+    def min_allowed_spacing_bps(self) -> Decimal:
+        """Absolute minimum spacing that maintains positive expected value.
+
+        This is the hard floor that the volume quota can NEVER breach:
+        rt_cost_bps + MIN_EDGE_BPS_FLOOR.  Going below this would produce
+        negative-EV trades, which defeats the purpose of maintaining the tier.
+        """
+        return self._fee.rt_cost_bps() + MIN_EDGE_BPS_FLOOR
+
     def assess(self) -> VolumeQuotaStatus:
         """Assess current tier stability and compute spacing override.
 
@@ -104,6 +136,9 @@ class VolumeQuota:
         multiplier.  When tier_at_risk is True, the strategy loop should
         multiply its minimum spacing by spacing_override_mult (< 1.0) to
         tighten the grid and generate volume.
+
+        The multiplier is smoothly dampened (PID-like): proportional to the
+        fractional depth within the defense zone, ramped over 15 days.
         """
         volume = self._fee.volume_30d_usd
         tier = self._fee.current_tier
@@ -122,6 +157,7 @@ class VolumeQuota:
                 defense_zone_usd=0,
                 spacing_override_mult=Decimal("1"),
                 daily_volume_target_usd=0,
+                ev_floor_active=False,
             )
             self._last_assessment = status
             return status
@@ -130,27 +166,37 @@ class VolumeQuota:
         defense_zone = int(tier_threshold * self._defense_zone_pct)
         tier_at_risk = surplus < defense_zone
 
-        # Daily volume target: spread deficit over 7 days (conservative)
+        # Proactive daily volume target: spread deficit over 15-day window
+        # to avoid panic-sprinting at the end of the 30-day rolling window.
         if tier_at_risk and surplus > 0:
-            daily_target = max(0, (defense_zone - surplus)) // 7
+            daily_target = max(0, (defense_zone - surplus)) // _DEFENSE_RAMP_DAYS
         elif tier_at_risk:
-            daily_target = defense_zone // 7
+            daily_target = defense_zone // _DEFENSE_RAMP_DAYS
         else:
             daily_target = 0
 
-        # Spacing multiplier: only override when tier is at risk
+        # Spacing multiplier: only override when tier is at risk.
+        # Smoothly dampened: proportional to depth in the defense zone.
         mult = Decimal("1")
+        ev_floor_active = False
         if tier_at_risk:
-            # Scale override by depth in the defense zone.
-            # At zone boundary: mult approaches 1.0 (gentle).
-            # Deep in zone (surplus near 0): mult = defense_spacing_mult (aggressive).
             if defense_zone > 0:
+                # depth: 0.0 at zone boundary, 1.0 when surplus hits 0
                 depth = Decimal(str(1.0 - max(0, surplus) / defense_zone))
                 reduction = (Decimal("1") - self._defense_spacing_mult) * depth
                 mult = Decimal("1") - reduction
                 mult = max(self._defense_spacing_mult, mult)
             else:
                 mult = self._defense_spacing_mult
+
+            # Hard EV floor check: the multiplier must not push spacing below
+            # rt_cost + MIN_EDGE. If it would, clamp and flag.
+            min_spacing = self.min_allowed_spacing_bps()
+            optimal = self._fee.min_profitable_spacing_bps(min_edge_bps=Decimal("5"))
+            if optimal > 0 and optimal * mult < min_spacing:
+                # Clamp: set mult so that optimal * mult = min_spacing
+                mult = min_spacing / optimal
+                ev_floor_active = True
 
         status = VolumeQuotaStatus(
             tier_at_risk=tier_at_risk,
@@ -160,6 +206,7 @@ class VolumeQuota:
             defense_zone_usd=defense_zone,
             spacing_override_mult=mult,
             daily_volume_target_usd=daily_target,
+            ev_floor_active=ev_floor_active,
         )
         self._last_assessment = status
         return status

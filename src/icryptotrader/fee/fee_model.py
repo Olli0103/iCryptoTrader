@@ -56,16 +56,23 @@ class FeeModel:
         self._current_tier = self._resolve_tier(volume_30d_usd)
 
     def maker_fee_bps(self) -> Decimal:
-        return self._current_tier.maker_bps
+        # Clamp to zero: some exchanges offer negative maker rebates,
+        # but our fee math assumes non-negative fees throughout.
+        return max(Decimal("0"), self._current_tier.maker_bps)
 
     def taker_fee_bps(self) -> Decimal:
-        return self._current_tier.taker_bps
+        return max(Decimal("0"), self._current_tier.taker_bps)
 
     def rt_cost_bps(self, maker_both_sides: bool = True) -> Decimal:
-        """Round-trip cost in bps. Default assumes maker on both buy and sell."""
+        """Round-trip cost in bps. Default assumes maker on both buy and sell.
+
+        Returns 0 for the top Kraken tier (0% maker fee). Callers that
+        use this as a divisor MUST guard against zero.
+        """
+        maker = max(Decimal("0"), self._current_tier.maker_bps)
         if maker_both_sides:
-            return self._current_tier.maker_bps * 2
-        return self._current_tier.maker_bps + self._current_tier.taker_bps
+            return maker * 2
+        return maker + max(Decimal("0"), self._current_tier.taker_bps)
 
     def expected_net_edge_bps(
         self,
@@ -96,12 +103,22 @@ class FeeModel:
         """Minimum grid spacing that yields at least min_edge_bps net profit.
 
         Used by the Quant Agent / Grid Engine to auto-calibrate grid spacing.
+        Always returns a positive value even at the zero-fee top tier.
         """
-        return self.rt_cost_bps(maker_both_sides) + adverse_selection_bps + min_edge_bps
+        result = self.rt_cost_bps(maker_both_sides) + adverse_selection_bps + min_edge_bps
+        # Ensure positive: at the zero-fee tier, rt_cost=0, but
+        # adverse_selection + min_edge should keep this positive.
+        return max(Decimal("1"), result)
 
     def fee_for_notional(self, notional_usd: Decimal, is_maker: bool = True) -> Decimal:
-        """Absolute fee in USD for a given notional trade size."""
-        rate = self._current_tier.maker_bps if is_maker else self._current_tier.taker_bps
+        """Absolute fee in USD for a given notional trade size.
+
+        Returns 0 for zero-fee tiers (top Kraken tier has 0% maker fee).
+        """
+        rate = max(
+            Decimal("0"),
+            self._current_tier.maker_bps if is_maker else self._current_tier.taker_bps,
+        )
         return notional_usd * rate / Decimal("10000")
 
     def would_cross_spread(
@@ -123,9 +140,10 @@ class FeeModel:
     def taker_penalty_bps(self) -> Decimal:
         """Extra cost in bps if an order accidentally becomes a taker.
 
-        maker_fee + taker_fee swing = the full round-trip cost difference.
+        taker_fee - maker_fee swing = the full cost difference. When maker
+        fee is 0 (top tier), the full taker fee is the penalty.
         """
-        return self._current_tier.taker_bps - self._current_tier.maker_bps
+        return max(Decimal("0"), self._current_tier.taker_bps - self._current_tier.maker_bps)
 
     def volume_to_next_tier(self) -> int | None:
         """USD volume needed to reach the next fee tier, or None if at max."""

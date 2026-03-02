@@ -26,7 +26,16 @@ _MAX_CHECKSUM_FAILURES = 3
 
 
 def _format_decimal(value: str) -> str:
-    """Format a decimal string for CRC32: remove '.', strip leading zeros."""
+    """Format a decimal string for CRC32: remove '.', strip leading zeros.
+
+    Handles scientific notation (e.g., '1E+5', '1E-7') which Python's
+    ``Decimal.__str__()`` can produce after arithmetic or for very
+    large/small values.  The Kraken CRC32 spec requires plain decimal
+    digit strings, so we normalize through ``Decimal`` formatting first.
+    """
+    if "E" in value or "e" in value:
+        # Scientific notation → convert to fixed-point string
+        value = format(Decimal(value), "f")
     return value.replace(".", "").lstrip("0") or "0"
 
 
