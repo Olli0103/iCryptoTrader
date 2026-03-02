@@ -115,10 +115,11 @@ class TestFullTickCycleE2E:
         # Bollinger should be active after filling window (5 ticks)
         assert bollinger.state is not None
 
-        # Commands should have been generated (buys and sells)
+        # Commands should have been generated (buys and sells).
+        # Multiple adds in the same tick are aggregated into batch_add.
         assert len(all_commands) > 0
         cmd_types = {cmd["type"] for cmd in all_commands}
-        assert "add" in cmd_types
+        assert "add" in cmd_types or "batch_add" in cmd_types
 
     def test_risk_pause_halts_commands(self) -> None:
         """When risk pause triggers, tick should produce no commands."""

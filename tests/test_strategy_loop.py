@@ -73,14 +73,18 @@ class TestBasicTick:
         commands = loop.tick(mid_price=Decimal("85000"))
         for cmd in commands:
             assert "type" in cmd
-            assert "slot_id" in cmd
             assert "params" in cmd
-            assert cmd["type"] in ("add", "amend", "cancel")
+            if cmd["type"] == "batch_add":
+                # batch_add uses slot_ids (plural) instead of slot_id
+                assert "slot_ids" in cmd
+            else:
+                assert "slot_id" in cmd
+            assert cmd["type"] in ("add", "amend", "cancel", "batch_add", "cancel_all")
 
     def test_first_tick_issues_add_orders(self) -> None:
         loop = _make_loop()
         commands = loop.tick(mid_price=Decimal("85000"))
-        add_commands = [c for c in commands if c["type"] == "add"]
+        add_commands = [c for c in commands if c["type"] in ("add", "batch_add")]
         assert len(add_commands) > 0
 
 
@@ -142,6 +146,9 @@ class TestBuySellBalance:
         for cmd in commands:
             if cmd["type"] == "add":
                 sides.add(cmd["params"].get("side"))
+            elif cmd["type"] == "batch_add":
+                for order in cmd["params"].get("orders", []):
+                    sides.add(order.get("side"))
         assert "buy" in sides
         assert "sell" in sides
 

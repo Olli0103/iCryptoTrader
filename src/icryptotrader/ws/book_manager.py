@@ -14,6 +14,7 @@ Checksum algorithm (Kraken v2):
 from __future__ import annotations
 
 import logging
+import time
 import zlib
 from collections.abc import Callable
 from decimal import Decimal
@@ -50,6 +51,7 @@ class OrderBook:
         self.checksum_failures: int = 0
         self.updates_applied: int = 0
         self.resync_count: int = 0
+        self._last_update_ts: float = 0.0  # monotonic time of last data
 
         # Auto-recovery callback: invoked when the book becomes invalid
         # due to consecutive CRC32 checksum failures. The caller should
@@ -72,6 +74,11 @@ class OrderBook:
     @property
     def symbol(self) -> str:
         return self._symbol
+
+    @property
+    def last_update_ts(self) -> float:
+        """Monotonic timestamp of the last snapshot/update applied."""
+        return self._last_update_ts
 
     def apply_snapshot(self, data: dict[str, Any], checksum_enabled: bool = True) -> bool:
         """Initialize book from a WS snapshot message.
@@ -107,6 +114,7 @@ class OrderBook:
         self._consecutive_checksum_failures = 0
         self._sequence = data.get("sequence", 0)
         self.updates_applied += 1
+        self._last_update_ts = time.monotonic()
         logger.info(
             "Book snapshot applied: %d asks, %d bids",
             len(self._asks), len(self._bids),
@@ -155,6 +163,7 @@ class OrderBook:
 
         self._sequence = data.get("sequence", self._sequence)
         self.updates_applied += 1
+        self._last_update_ts = time.monotonic()
         return True
 
     def compute_checksum(self) -> int:
