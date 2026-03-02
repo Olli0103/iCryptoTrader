@@ -28,6 +28,7 @@ all subsystems. Each tick:
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 import threading
 import time
@@ -84,6 +85,11 @@ class StrategyLoop:
         for cmd in commands:
             await ws2.send(cmd["frame"])
     """
+
+    # Time-decimation interval for price history deques.
+    # At 1 sample/sec, maxlen=3600 covers exactly 1 hour and
+    # maxlen=86400 covers exactly 24 hours regardless of tick rate.
+    _PRICE_HISTORY_SAMPLE_SEC = 1.0
 
     def __init__(
         self,
@@ -156,9 +162,15 @@ class StrategyLoop:
         # Hedge action from HedgeManager (set before each tick)
         self._hedge_action: HedgeAction | None = None
 
-        # Price history for 1h/24h change (P1-5)
+        # Price history for 1h/24h change — time-decimated.
+        # Only one entry per second is stored, so maxlen matches the actual
+        # time horizon regardless of tick frequency.  At 10 ticks/sec the old
+        # approach would fill maxlen=86400 in 2.4 hours, giving the AI and
+        # regime classifiers a wildly compressed view of macro price action.
         self._price_history_1h: deque[tuple[float, Decimal]] = deque(maxlen=3600)
         self._price_history_24h: deque[tuple[float, Decimal]] = deque(maxlen=86400)
+        self._price_history_1h_last_ts: float = 0.0
+        self._price_history_24h_last_ts: float = 0.0
 
         # Metrics
         self.ticks: int = 0
@@ -280,10 +292,17 @@ class StrategyLoop:
         self._inv.update_price(mid_price)
         self._regime.update_price(mid_price)
 
-        # Track price history for 1h/24h change calculations (P1-5)
+        # Track price history for 1h/24h change calculations.
+        # Time-decimated: only one sample per _PRICE_HISTORY_SAMPLE_SEC to
+        # ensure maxlen corresponds to real wall-clock time, not tick count.
         now_ts = time.time()
-        self._price_history_1h.append((now_ts, mid_price))
-        self._price_history_24h.append((now_ts, mid_price))
+        interval = self._PRICE_HISTORY_SAMPLE_SEC
+        if now_ts - self._price_history_1h_last_ts >= interval:
+            self._price_history_1h.append((now_ts, mid_price))
+            self._price_history_1h_last_ts = now_ts
+        if now_ts - self._price_history_24h_last_ts >= interval:
+            self._price_history_24h.append((now_ts, mid_price))
+            self._price_history_24h_last_ts = now_ts
 
         # 2. Check price velocity circuit breaker
         if self._risk.check_price_velocity(mid_price):
@@ -569,17 +588,27 @@ class StrategyLoop:
     def _compute_price_change(
         history: deque[tuple[float, Decimal]], window_sec: int,
     ) -> float:
-        """Compute price change percentage over a time window."""
+        """Compute price change percentage over a time window.
+
+        Uses bisect for O(log N) lookup instead of linear scan.
+        Since the deque is time-ordered (monotonically increasing timestamps),
+        we extract timestamps into a list for binary search.
+        """
         if len(history) < 2:
             return 0.0
         now = history[-1][0]
         cutoff = now - window_sec
-        # Find oldest entry within window
-        oldest_price = history[0][1]
-        for ts, price in history:
-            if ts >= cutoff:
-                oldest_price = price
-                break
+
+        # Binary search for the cutoff timestamp.
+        # bisect_left finds the insertion point for cutoff in the sorted
+        # timestamp sequence — the entry at that index is the oldest
+        # sample within our desired window.
+        timestamps = [entry[0] for entry in history]
+        idx = bisect.bisect_left(timestamps, cutoff)
+        if idx >= len(history):
+            idx = len(history) - 1
+
+        oldest_price = history[idx][1]
         current_price = history[-1][1]
         if oldest_price <= 0:
             return 0.0
