@@ -72,6 +72,7 @@ class InventoryArbiter:
         max_single_rebalance_pct: float = 0.10,
         max_rebalance_pct_per_min: float = 0.01,
         dead_band_pct: float = 0.02,
+        inventory_half_life_sec: float = 7200.0,
     ) -> None:
         self._limits = limits or dict(DEFAULT_LIMITS)
         self._max_rebalance_pct = max_single_rebalance_pct
@@ -95,6 +96,15 @@ class InventoryArbiter:
         # BTC reserved by pending orders (not yet filled)
         self._btc_reserved_buy = Decimal("0")  # USD committed to pending buys
         self._btc_reserved_sell = Decimal("0")  # BTC committed to pending sells
+
+        # Inventory time-decay: tracks how long inventory has been deviating
+        # from target in the same direction.  A 10% deviation acquired 5s ago
+        # is normal market-making. The same deviation held for 6h is toxic
+        # bag-holding. The A-S model should increase urgency (skew) the
+        # longer the deviation persists.
+        self._inventory_half_life_sec = inventory_half_life_sec
+        self._deviation_sign: int = 0  # -1, 0, +1
+        self._deviation_since_ts: float = time.monotonic()
 
     @property
     def btc_balance(self) -> Decimal:
@@ -181,6 +191,56 @@ class InventoryArbiter:
         limits = self.current_limits()
         alloc = self.btc_allocation_pct
         return abs(alloc - limits.target_pct) <= self._dead_band_pct
+
+    def update_deviation_tracker(self) -> None:
+        """Update the deviation sign tracker for time-decay.
+
+        Call this after ``update_price()`` to detect sign changes in the
+        inventory deviation from target.  When the sign flips (over → under
+        or vice versa), the timer resets.
+        """
+        limits = self.current_limits()
+        alloc = self.btc_allocation_pct
+        delta = alloc - limits.target_pct
+
+        if abs(delta) < self._dead_band_pct:
+            new_sign = 0
+        elif delta > 0:
+            new_sign = 1
+        else:
+            new_sign = -1
+
+        if new_sign != self._deviation_sign:
+            self._deviation_sign = new_sign
+            self._deviation_since_ts = time.monotonic()
+
+    @property
+    def deviation_duration_sec(self) -> float:
+        """How long (in seconds) the current deviation direction has persisted."""
+        if self._deviation_sign == 0:
+            return 0.0
+        return time.monotonic() - self._deviation_since_ts
+
+    def time_decay_multiplier(self) -> float:
+        """Compute a time-decay urgency multiplier for inventory skew.
+
+        Returns a value >= 1.0 that grows logarithmically as the deviation
+        persists.  The A-S model should multiply ``inventory_delta`` by this
+        value to increase urgency for long-held deviations.
+
+        Formula: ``1 + ln(1 + duration / half_life)``
+
+        At t=0: multiplier = 1.0 (standard behavior)
+        At t=half_life (2h default): multiplier ≈ 1.69
+        At t=2*half_life (4h): multiplier ≈ 2.10
+        At t=6h: multiplier ≈ 2.39
+        """
+        import math
+
+        duration = self.deviation_duration_sec
+        if duration <= 0 or self._inventory_half_life_sec <= 0:
+            return 1.0
+        return 1.0 + math.log(1.0 + duration / self._inventory_half_life_sec)
 
     def check_buy(self, qty_btc: Decimal) -> Decimal:
         """Check how much of a buy order is allowed. Returns clamped quantity."""

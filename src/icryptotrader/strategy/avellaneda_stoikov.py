@@ -90,6 +90,7 @@ class AvellanedaStoikov:
         inventory_delta: Decimal,
         fee_floor_bps: Decimal,
         obi: float = 0.0,
+        time_decay_mult: float = 1.0,
     ) -> ASResult:
         """Compute optimal bid/ask spacing.
 
@@ -101,6 +102,9 @@ class AvellanedaStoikov:
             fee_floor_bps: Minimum profitable spacing from fee model
                 (``GridEngine.optimal_spacing_bps()``).
             obi: Order book imbalance [-1, 1]. Positive = bid pressure (bullish).
+            time_decay_mult: Time-decay urgency multiplier from InventoryArbiter.
+                >= 1.0. Scales inventory_delta to increase urgency for
+                long-held deviations (T-to-Liquidation risk).
 
         Returns:
             ASResult with buy_spacing_bps and sell_spacing_bps.
@@ -109,9 +113,12 @@ class AvellanedaStoikov:
         raw_half = self._gamma * abs(volatility_bps)
         half_spread = max(fee_floor_bps, min(self._max_spread, raw_half))
 
-        # 2. Inventory skew: proportional to both σ and inventory position
-        #    When long (delta > 0): positive skew → wider buy, tighter sell
-        raw_inv_skew = self._gamma * abs(volatility_bps) * inventory_delta
+        # 2. Inventory skew: proportional to both σ and inventory position.
+        #    When long (delta > 0): positive skew → wider buy, tighter sell.
+        #    Time-decay: multiply delta by time_decay_mult so that long-held
+        #    deviations produce increasingly aggressive mean-reversion skew.
+        effective_delta = inventory_delta * Decimal(str(max(1.0, time_decay_mult)))
+        raw_inv_skew = self._gamma * abs(volatility_bps) * effective_delta
         inv_skew = max(-self._max_skew, min(self._max_skew, raw_inv_skew))
 
         # 3. OBI adjustment: positive OBI (bullish) → tighter buy, wider sell

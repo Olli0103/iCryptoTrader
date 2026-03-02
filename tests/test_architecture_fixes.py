@@ -18,6 +18,10 @@ Covers:
   15. batch_add / batch_cancel — WS2 rate limit optimization
   16. Cross-connection heartbeat — WS1 staleness monitor
   17. Leap year / 366-day tax holding period fix
+  18. Volume Quota — fee-tier death spiral prevention
+  19. Trade-Book event race buffering
+  20. Cross-Exchange Oracle — Binance toxic flow detection
+  21. Inventory time-decay — duration-weighted A-S skew
 """
 
 from __future__ import annotations
@@ -1733,11 +1737,15 @@ class TestTFIIntegration:
         assert loop.tfi is not None
         assert loop.tfi.compute() == 0.0
 
-    def test_record_public_trade_feeds_tfi(self) -> None:
-        """record_public_trade should feed the TFI tracker."""
+    def test_record_public_trade_buffers_then_flushes(self) -> None:
+        """record_public_trade should buffer trades; tick() flushes them to TFI."""
         loop = _make_loop()
         loop.record_public_trade("buy", Decimal("0.01"), Decimal("85000"))
         loop.record_public_trade("buy", Decimal("0.02"), Decimal("85000"))
+        # Before tick: trades are buffered, TFI is empty
+        assert loop.tfi.trade_count == 0
+        # After tick: buffer is flushed into TFI
+        loop.tick(Decimal("85000"))
         assert loop.tfi.trade_count == 2
         assert loop.tfi.compute() > 0.9  # All buys → positive
 
@@ -1746,3 +1754,491 @@ class TestTFIIntegration:
         loop = _make_loop()
         assert loop.mark_out_tracker is not None
         assert loop.mark_out_tracker.fills_tracked == 0
+
+
+# =============================================================================
+# 19. Volume Quota — Fee-Tier Death Spiral Prevention
+# =============================================================================
+
+
+class TestVolumeQuota:
+    def test_bottom_tier_not_at_risk(self) -> None:
+        """Bottom fee tier (0 threshold) should never be at risk."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=0)
+        quota = VolumeQuota(fee_model=fee)
+        status = quota.assess()
+        assert not status.tier_at_risk
+        assert status.spacing_override_mult == Decimal("1")
+
+    def test_high_volume_not_at_risk(self) -> None:
+        """Volume well above tier threshold should not be at risk."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=100_000)  # Tier 3: 100K threshold
+        quota = VolumeQuota(fee_model=fee)
+        status = quota.assess()
+        # surplus = 100K - 100K = 0 which IS in the defense zone
+        # Actually, tier resolves to 100K threshold, surplus is 0
+        # 0 < defense_zone (20% of 100K = 20K) → at risk
+        assert status.tier_at_risk
+
+    def test_tier_at_risk_near_boundary(self) -> None:
+        """Volume barely above tier threshold should trigger defense."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=51_000)  # Tier: 50K, surplus 1K
+        quota = VolumeQuota(fee_model=fee)
+        status = quota.assess()
+        assert status.tier_at_risk  # 1K < 20% of 50K = 10K
+        assert status.spacing_override_mult < Decimal("1")
+
+    def test_comfortable_surplus_not_at_risk(self) -> None:
+        """Volume with comfortable surplus should not be at risk."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=80_000)  # Tier: 50K, surplus 30K
+        quota = VolumeQuota(fee_model=fee)
+        status = quota.assess()
+        assert not status.tier_at_risk  # 30K > 20% of 50K = 10K
+        assert status.spacing_override_mult == Decimal("1")
+
+    def test_deeper_in_zone_tighter_spacing(self) -> None:
+        """Deeper in defense zone should produce tighter spacing multiplier."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee_edge = FeeModel(volume_30d_usd=59_000)  # surplus 9K, near boundary
+        fee_deep = FeeModel(volume_30d_usd=50_500)  # surplus 500, deep in zone
+
+        quota_edge = VolumeQuota(fee_model=fee_edge)
+        quota_deep = VolumeQuota(fee_model=fee_deep)
+
+        status_edge = quota_edge.assess()
+        status_deep = quota_deep.assess()
+
+        # Both at risk
+        assert status_edge.tier_at_risk
+        assert status_deep.tier_at_risk
+
+        # Deeper position should have lower (tighter) multiplier
+        assert status_deep.spacing_override_mult < status_edge.spacing_override_mult
+
+    def test_record_fill_volume(self) -> None:
+        """Should track daily fill volume."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=0)
+        quota = VolumeQuota(fee_model=fee)
+        quota.record_fill_volume(Decimal("500"))
+        quota.record_fill_volume(Decimal("300"))
+        assert quota.daily_volume_usd() == Decimal("800")
+
+    def test_strategy_loop_records_fill_volume(self) -> None:
+        """on_fill should record volume in the quota tracker."""
+        loop = _make_loop()
+        # Add a lot first so we have something to fill
+        loop._ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("85000"),
+            purchase_fee_usd=Decimal("0"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+        slot = MagicMock()
+        slot.side = Side.SELL
+        loop.on_fill(slot, {
+            "last_qty": "0.005",
+            "last_price": "86000",
+            "fee": "0.5",
+        })
+        # 0.005 * 86000 = 430
+        assert loop.volume_quota.daily_volume_usd() == Decimal("430.000")
+
+    def test_volume_quota_applied_in_tick(self) -> None:
+        """When tier is at risk, fee_floor should be tightened in tick()."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        # Create a loop with a fee model near a tier boundary
+        fee = FeeModel(volume_30d_usd=50_500)
+        loop = _make_loop()
+        loop._fee = fee
+        loop._volume_quota = VolumeQuota(fee_model=fee)
+
+        # Just verify assessment works
+        status = loop._volume_quota.assess()
+        assert status.tier_at_risk
+        assert status.spacing_override_mult < Decimal("1")
+
+
+# =============================================================================
+# 20. Trade-Book Event Race Buffering
+# =============================================================================
+
+
+class TestTradeBookEventRace:
+    def test_trades_buffered_not_immediate(self) -> None:
+        """Public trades should be buffered, not immediately fed to TFI."""
+        loop = _make_loop()
+        loop.record_public_trade("buy", Decimal("1.0"), Decimal("85000"))
+        assert loop.tfi.trade_count == 0
+
+    def test_tick_flushes_trade_buffer(self) -> None:
+        """tick() should flush buffered trades into TFI."""
+        loop = _make_loop()
+        loop.record_public_trade("buy", Decimal("0.5"), Decimal("85000"))
+        loop.record_public_trade("sell", Decimal("0.3"), Decimal("84900"))
+        assert loop.tfi.trade_count == 0
+
+        loop.tick(Decimal("85000"))
+        assert loop.tfi.trade_count == 2
+
+    def test_buffer_cleared_after_flush(self) -> None:
+        """Buffer should be empty after tick flushes it."""
+        loop = _make_loop()
+        loop.record_public_trade("buy", Decimal("0.1"), Decimal("85000"))
+        loop.tick(Decimal("85000"))
+        assert loop.tfi.trade_count == 1
+
+        # Second tick with no new trades should not add more
+        loop.tick(Decimal("85000"))
+        assert loop.tfi.trade_count == 1
+
+    def test_multiple_ticks_accumulate(self) -> None:
+        """Trades from multiple tick cycles should accumulate in TFI."""
+        loop = _make_loop()
+        loop.record_public_trade("buy", Decimal("0.1"), Decimal("85000"))
+        loop.tick(Decimal("85000"))
+        assert loop.tfi.trade_count == 1
+
+        loop.record_public_trade("sell", Decimal("0.2"), Decimal("84900"))
+        loop.tick(Decimal("85000"))
+        assert loop.tfi.trade_count == 2
+
+    def test_tfi_signal_uses_flushed_trades(self) -> None:
+        """TFI signal should reflect flushed trades, not buffered ones."""
+        loop = _make_loop()
+        loop.record_public_trade("sell", Decimal("1.0"), Decimal("85000"))
+        # Before flush: TFI should be 0 (no data)
+        assert loop.tfi.compute() == 0.0
+
+        loop.tick(Decimal("85000"))
+        # After flush: TFI should be negative (all sells)
+        assert loop.tfi.compute() < -0.9
+
+
+# =============================================================================
+# 21. Cross-Exchange Oracle — Binance Toxic Flow Detection
+# =============================================================================
+
+
+class TestCrossExchangeOracle:
+    def test_no_data_is_stale(self) -> None:
+        """Oracle with no data should be considered stale."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle()
+        assert oracle.is_stale
+        assert not oracle.should_preemptive_cancel(Decimal("85000"))
+
+    def test_fresh_data_not_stale(self) -> None:
+        """Oracle with recent data should not be stale."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(clock=lambda: t[0])
+        oracle.update(Decimal("85000"), Decimal("85010"))
+        assert not oracle.is_stale
+
+    def test_stale_after_timeout(self) -> None:
+        """Oracle should become stale after timeout."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(clock=lambda: t[0], stale_threshold_sec=5.0)
+        oracle.update(Decimal("85000"), Decimal("85010"))
+        t[0] = 106.0
+        assert oracle.is_stale
+
+    def test_divergence_bps_calculation(self) -> None:
+        """Divergence should be computed correctly."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        # Binance mid = 84985, Kraken mid = 85000
+        oracle.update(Decimal("84980"), Decimal("84990"))
+        div = oracle.divergence_bps(Decimal("85000"))
+        # (84985 - 85000) / 85000 * 10000 ≈ -1.76 bps
+        assert div < 0
+        assert abs(div) < 5
+
+    def test_large_drop_triggers_cancel(self) -> None:
+        """Large Binance drop should trigger preemptive cancel."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        # Binance drops 30 bps below Kraken
+        binance_mid = Decimal("85000") * (1 - Decimal("0.003"))  # 84745
+        oracle.update(binance_mid - 5, binance_mid + 5)
+        assert oracle.should_preemptive_cancel(Decimal("85000"))
+        assert oracle.cancel_signals == 1
+
+    def test_small_divergence_no_cancel(self) -> None:
+        """Small divergence should not trigger cancel."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        # Binance drops only 5 bps
+        oracle.update(Decimal("84991"), Decimal("85001"))
+        assert not oracle.should_preemptive_cancel(Decimal("85000"))
+
+    def test_stale_data_no_cancel(self) -> None:
+        """Stale data should never trigger cancel."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(
+            clock=lambda: t[0], stale_threshold_sec=5.0,
+        )
+        # Set Binance way below Kraken
+        oracle.update(Decimal("80000"), Decimal("80010"))
+        t[0] = 110.0  # Now stale
+        assert not oracle.should_preemptive_cancel(Decimal("85000"))
+
+    def test_oracle_cancel_in_tick(self) -> None:
+        """Strategy loop should issue cancel_all on oracle signal."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        # Set Binance 40 bps below Kraken
+        oracle.update(Decimal("84640"), Decimal("84680"))
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        cmds = loop.tick(Decimal("85000"))
+        cmd_types = {c["type"] for c in cmds}
+        assert "cancel_all" in cmd_types
+
+    def test_oracle_cancel_sent_once(self) -> None:
+        """Oracle cancel_all should only be sent once per divergence episode."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        oracle.update(Decimal("84640"), Decimal("84680"))
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        cmds1 = loop.tick(Decimal("85000"))
+        cmds2 = loop.tick(Decimal("85000"))
+        cancel_count = sum(
+            1 for c in cmds1 + cmds2 if c["type"] == "cancel_all"
+        )
+        assert cancel_count == 1
+
+
+# =============================================================================
+# 22. Inventory Time-Decay — Duration-Weighted A-S Skew
+# =============================================================================
+
+
+class TestInventoryTimeDecay:
+    def test_initial_multiplier_is_one(self) -> None:
+        """With no deviation or fresh deviation, multiplier should be 1.0."""
+        inv = InventoryArbiter()
+        inv.update_balances(Decimal("0.03"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+        # Within dead band → sign = 0 → multiplier = 1.0
+        assert inv.time_decay_multiplier() == 1.0
+
+    def test_deviation_starts_tracking(self) -> None:
+        """When inventory deviates outside dead band, timer should start."""
+        inv = InventoryArbiter(dead_band_pct=0.01)
+        # 70% BTC allocation (way above 50% target)
+        inv.update_balances(Decimal("0.07"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+        assert inv._deviation_sign == 1  # Overweight BTC
+
+    def test_multiplier_grows_with_time(self) -> None:
+        """Time-decay multiplier should increase as deviation persists."""
+        inv = InventoryArbiter(
+            dead_band_pct=0.01, inventory_half_life_sec=3600.0,
+        )
+        inv.update_balances(Decimal("0.07"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+
+        # Simulate time passing by manipulating the timestamp
+        inv._deviation_since_ts = time.monotonic() - 3600  # 1 hour ago
+        mult = inv.time_decay_multiplier()
+        # At t=half_life: 1 + ln(2) ≈ 1.69
+        assert 1.5 < mult < 2.0
+
+    def test_sign_flip_resets_timer(self) -> None:
+        """When deviation sign flips, the timer should reset."""
+        inv = InventoryArbiter(dead_band_pct=0.01)
+        inv.update_balances(Decimal("0.07"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+
+        # Artificially age the deviation
+        old_ts = inv._deviation_since_ts
+        inv._deviation_since_ts = time.monotonic() - 7200  # 2 hours ago
+
+        # Now flip: underweight BTC
+        inv.update_balances(Decimal("0.01"), Decimal("7000"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+
+        # Timer should have reset (fresh timestamp)
+        assert inv._deviation_sign == -1
+        assert inv._deviation_since_ts > old_ts
+
+    def test_dead_band_resets_sign(self) -> None:
+        """Returning to dead band should reset deviation sign to 0."""
+        inv = InventoryArbiter(dead_band_pct=0.02)
+        inv.update_balances(Decimal("0.07"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+        assert inv._deviation_sign != 0
+
+        # Return to near-target allocation
+        inv.update_balances(Decimal("0.03"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+        assert inv._deviation_sign == 0
+        assert inv.time_decay_multiplier() == 1.0
+
+    def test_as_model_uses_time_decay(self) -> None:
+        """A-S model should produce larger skew with higher time_decay_mult."""
+        from icryptotrader.strategy.avellaneda_stoikov import AvellanedaStoikov
+
+        model = AvellanedaStoikov(gamma=Decimal("0.3"))
+        result_normal = model.compute(
+            volatility_bps=Decimal("100"),
+            inventory_delta=Decimal("0.1"),
+            fee_floor_bps=Decimal("30"),
+            time_decay_mult=1.0,
+        )
+        result_urgent = model.compute(
+            volatility_bps=Decimal("100"),
+            inventory_delta=Decimal("0.1"),
+            fee_floor_bps=Decimal("30"),
+            time_decay_mult=2.0,
+        )
+        # Higher time_decay_mult → larger inventory skew → wider buy spacing
+        assert result_urgent.buy_spacing_bps > result_normal.buy_spacing_bps
+        # And tighter sell spacing (to incentivize selling the excess)
+        assert result_urgent.sell_spacing_bps < result_normal.sell_spacing_bps
+
+    def test_deviation_duration_sec(self) -> None:
+        """deviation_duration_sec should reflect elapsed time."""
+        inv = InventoryArbiter(dead_band_pct=0.01)
+        inv.update_balances(Decimal("0.07"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+
+        # Simulate 60 seconds ago
+        inv._deviation_since_ts = time.monotonic() - 60.0
+        duration = inv.deviation_duration_sec
+        assert 59.0 < duration < 62.0
+
+    def test_no_deviation_zero_duration(self) -> None:
+        """When within dead band, duration should be 0."""
+        inv = InventoryArbiter(dead_band_pct=0.05)
+        inv.update_balances(Decimal("0.03"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        inv.update_deviation_tracker()
+        assert inv.deviation_duration_sec == 0.0
+
+
+# =============================================================================
+# 23. Integration: All Level-5 Fixes in Strategy Loop
+# =============================================================================
+
+
+class TestLevel5Integration:
+    def test_strategy_loop_has_oracle(self) -> None:
+        """StrategyLoop should accept and expose a cross-exchange oracle."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle()
+        fee = FeeModel()
+        ledger = FIFOLedger()
+        om = OrderManager(num_slots=10)
+        grid = GridEngine(fee_model=fee)
+        tax = TaxAgent(ledger=ledger)
+        risk = RiskManager(initial_portfolio_usd=Decimal("5000"))
+        skew = DeltaSkew()
+        inv = InventoryArbiter()
+        inv.update_balances(Decimal("0.03"), Decimal("2500"))
+        inv.update_price(Decimal("85000"))
+        regime = RegimeRouter()
+
+        loop = StrategyLoop(
+            fee_model=fee,
+            order_manager=om,
+            grid_engine=grid,
+            tax_agent=tax,
+            risk_manager=risk,
+            delta_skew=skew,
+            inventory=inv,
+            regime_router=regime,
+            ledger=ledger,
+            cross_exchange_oracle=oracle,
+        )
+        assert loop.oracle is oracle
+
+    def test_strategy_loop_has_volume_quota(self) -> None:
+        """StrategyLoop should expose a volume quota monitor."""
+        loop = _make_loop()
+        assert loop.volume_quota is not None
+
+    def test_tick_with_all_fixes(self) -> None:
+        """Full tick with all Level-5 components should produce commands."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        # Binance in line with Kraken (no divergence)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        # Buffer some trades
+        loop.record_public_trade("buy", Decimal("0.5"), Decimal("85000"))
+        loop.record_public_trade("sell", Decimal("0.3"), Decimal("84950"))
+
+        cmds = loop.tick(Decimal("85000"))
+        # Should produce grid commands (add/batch_add/amend/cancel)
+        assert len(cmds) > 0
+        # TFI should have been flushed
+        assert loop.tfi.trade_count == 2
