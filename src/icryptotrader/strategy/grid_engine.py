@@ -153,6 +153,13 @@ class GridEngine:
         # Geometric is safe — never goes negative regardless of levels/spacing.
         one = Decimal("1")
 
+        # Dedup: when tight spacing + large tick size causes multiple grid
+        # levels to quantize to the same price, step one tick further away
+        # to keep the grid strictly monotonic and avoid stacking redundant
+        # orders on the same price level.
+        seen_buy_prices: set[Decimal] = set()
+        seen_sell_prices: set[Decimal] = set()
+
         for i in range(num_buy_levels):
             if self._geometric:
                 price = (mid_price * (one - buy_factor) ** (i + 1)).quantize(
@@ -163,8 +170,12 @@ class GridEngine:
                 price = (mid_price * (one - offset)).quantize(
                     self._price_tick, rounding=ROUND_HALF_UP,
                 )
+            # Resolve collisions: step one tick lower per duplicate
+            while price in seen_buy_prices and price > 0:
+                price -= self._price_tick
             if price <= 0:
                 break
+            seen_buy_prices.add(price)
             qty = self._qty_for_price(price, buy_qty_scale)
             if qty >= MIN_ORDER_BTC:
                 buy_levels.append(GridLevel(
@@ -181,6 +192,10 @@ class GridEngine:
                 price = (mid_price * (one + offset)).quantize(
                     self._price_tick, rounding=ROUND_HALF_UP,
                 )
+            # Resolve collisions: step one tick higher per duplicate
+            while price in seen_sell_prices:
+                price += self._price_tick
+            seen_sell_prices.add(price)
             qty = self._qty_for_price(price, sell_qty_scale)
             if qty >= MIN_ORDER_BTC:
                 sell_levels.append(GridLevel(

@@ -76,6 +76,8 @@ class WSPrivate:
 
         self._ws: ws_client.ClientConnection | None = None
         self._token: str = ""
+        self._token_ts: float = 0.0  # monotonic time of last token fetch
+        self._token_ttl_sec: float = 780.0  # 13 minutes (tokens valid for 15m)
         self._running = False
         self._connected = asyncio.Event()
         self._reconnect_count = 0
@@ -244,9 +246,17 @@ class WSPrivate:
 
     async def _connect_and_run(self) -> None:
         """Single connection lifecycle: token → connect → subscribe → receive."""
-        # Get fresh WS token
-        self._token = await self._get_ws_token()
-        logger.info("WS2 obtained auth token")
+        # Reuse cached token if still valid (tokens last 15 minutes).
+        # During WS disconnect storms (e.g., Kraken maintenance dropping TCP
+        # after handshake), hitting the REST endpoint on every reconnect
+        # attempt burns through REST API rate limits.
+        now = time.monotonic()
+        if not self._token or (now - self._token_ts) >= self._token_ttl_sec:
+            self._token = await self._get_ws_token()
+            self._token_ts = now
+            logger.info("WS2 obtained fresh auth token")
+        else:
+            logger.info("WS2 reusing cached auth token (age=%.0fs)", now - self._token_ts)
 
         logger.info("WS2 connecting to %s", self._ws_url)
         async with ws_client.connect(
