@@ -48,10 +48,14 @@ if TYPE_CHECKING:
     from icryptotrader.ws.book_manager import OrderBook
 
 from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
-from icryptotrader.fee.volume_quota import VolumeQuota
+from icryptotrader.fee.volume_quota import MIN_EDGE_BPS_FLOOR, VolumeQuota
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
 from icryptotrader.order.order_manager import Action, DesiredLevel, OrderManager
-from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+from icryptotrader.risk.cross_exchange_oracle import (
+    UNKNOWN_SPREAD_MULTIPLIER,
+    CrossExchangeOracle,
+    OracleState,
+)
 from icryptotrader.risk.delta_skew import DeltaSkew  # noqa: TC001
 from icryptotrader.risk.hedge_manager import HedgeAction  # noqa: TC001
 from icryptotrader.risk.mark_out_tracker import MarkOutTracker
@@ -175,6 +179,7 @@ class StrategyLoop:
         # sweep our resting bids ~50-100ms later. Preemptive cancel protects.
         self._oracle = cross_exchange_oracle
         self._oracle_cancel_sent = False
+        self._oracle_spread_mult = Decimal("1")  # reset each tick
 
         # Volume Quota: prevents fee-tier death spiral when mark-out tracker
         # forces wider spreads → lower fill rate → lower 30-day volume →
@@ -397,30 +402,62 @@ class StrategyLoop:
         if self._book is not None and self._book.is_valid:
             self._mark_out.check_mark_outs(self._book.mid_price)
 
-        # 0d. Cross-exchange oracle: if Binance mid-price has dropped sharply
-        # below Kraken mid, HFT arbitrageurs will sweep our resting bids
-        # within ~50-100ms. Issue preemptive cancel_all before they arrive.
+        # 0d. PRIORITY MATRIX — Hierarchical Signal Resolution
+        #
+        # Three independent subsystems compete for control of the grid spread:
+        #   - cross_exchange_oracle: wants to pause entirely (Binance dumping)
+        #   - trade_flow_imbalance + mark_out: wants to widen (toxic flow)
+        #   - volume_quota: wants to tighten (monthly volume target)
+        #
+        # Strict priority order prevents contradictory actions:
+        #   P0 (ABSOLUTE VETO): Oracle cancel_all — if Binance drops, pull all.
+        #   P1 (RISK DEFENSE):  Mark-out + TFI — widen if flow is toxic.
+        #   P2 (ECONOMIC):      Volume quota — tighten ONLY if P0/P1 are neutral.
+        #
+        # Additionally, oracle STATE_UNKNOWN (dead-man's switch: Binance feed
+        # stale >1.5s) forces 3x spread widening until feed recovers, because
+        # we cannot trust our defense shield is active.
+        self._oracle_spread_mult = Decimal("1")  # reset each tick
+
         if (
             self._oracle is not None
             and self._book is not None
             and self._book.is_valid
         ):
-            if self._oracle.should_preemptive_cancel(self._book.mid_price):
+            oracle_assessment = self._oracle.assess(self._book.mid_price)
+
+            if oracle_assessment.state == OracleState.DIVERGENCE:
+                # P0: ABSOLUTE VETO — cancel everything immediately
                 if not self._oracle_cancel_sent:
                     logger.warning(
-                        "Cross-exchange oracle: preemptive cancel_all "
-                        "(Binance mid=%.2f, Kraken mid=%.2f)",
-                        self._oracle.binance_mid, self._book.mid_price,
+                        "P0 VETO: oracle divergence %.1f bps "
+                        "(threshold=%.1f bps, ρ=%.3f) — cancel_all",
+                        oracle_assessment.divergence_bps,
+                        oracle_assessment.effective_threshold_bps,
+                        oracle_assessment.correlation_rho,
                     )
                     commands.append({"type": "cancel_all", "slot_id": -1, "params": {}})
                     self._oracle_cancel_sent = True
                     self.last_tick_duration_ms = (time.monotonic() - tick_start) * 1000
                     self._record_tick_metrics()
                     return commands
-            elif self._oracle_cancel_sent:
-                # Oracle divergence resolved
-                logger.info("Cross-exchange oracle: divergence resolved, resuming")
-                self._oracle_cancel_sent = False
+
+            elif oracle_assessment.state == OracleState.UNKNOWN:
+                # Dead-man's switch: Binance feed stale — widen spreads 3x
+                # until the feed is re-established.  We can't trust defense.
+                self._oracle_spread_mult = oracle_assessment.spread_multiplier
+                if self._oracle_cancel_sent:
+                    logger.info("Oracle: divergence resolved, but feed is stale (UNKNOWN)")
+                    self._oracle_cancel_sent = False
+
+            else:
+                # HEALTHY — clear any previous cancel flag
+                if self._oracle_cancel_sent:
+                    logger.info(
+                        "Oracle: divergence resolved (ρ=%.3f), resuming",
+                        oracle_assessment.correlation_rho,
+                    )
+                    self._oracle_cancel_sent = False
 
         # 1. Update market data
         self._inv.update_price(mid_price)
@@ -535,12 +572,27 @@ class StrategyLoop:
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
         fee_floor = self._grid.optimal_spacing_bps()
 
-        # Volume Quota: when 30-day volume is close to dropping a fee tier,
-        # tighten the fee floor to generate volume and prevent the death
-        # spiral (wider spreads → less volume → higher fees → wider spreads).
+        # P2 (ECONOMIC): Volume Quota — tighten ONLY when P0 and P1 are neutral.
+        # The priority matrix prevents volume quota from tightening spreads
+        # during oracle divergence (P0) or toxic flow (P1).
+        #
+        # P0 check: oracle_spread_mult > 1 means STATE_UNKNOWN → don't tighten.
+        # P1 check: if TFI signal is strongly directional (|tfi| > 0.5),
+        #   flow is toxic → don't tighten to chase volume into toxic flow.
+        p0_neutral = self._oracle_spread_mult == Decimal("1")
+        p1_neutral = abs(tfi) < 0.5
+
         vq_status = self._volume_quota.assess()
-        if vq_status.tier_at_risk:
+        if vq_status.tier_at_risk and p0_neutral and p1_neutral:
+            # Safe to tighten: no cross-exchange threat, no toxic flow
             fee_floor = fee_floor * vq_status.spacing_override_mult
+            # Hard EV floor: never go below rt_cost + 0.5 bps
+            ev_floor = self._volume_quota.min_allowed_spacing_bps()
+            fee_floor = max(fee_floor, ev_floor)
+
+        # Apply oracle dead-man's switch: STATE_UNKNOWN → widen 3x
+        if self._oracle_spread_mult > Decimal("1"):
+            fee_floor = fee_floor * self._oracle_spread_mult
 
         # Avellaneda-Stoikov: when enabled, computes optimal spread and
         # inventory skew in one model, replacing Bollinger + DeltaSkew.

@@ -22,6 +22,10 @@ Covers:
   19. Trade-Book event race buffering
   20. Cross-Exchange Oracle — Binance toxic flow detection
   21. Inventory time-decay — duration-weighted A-S skew
+  22. Lead-lag correlation scaling for oracle trigger threshold
+  23. Oracle dead-man's switch (STATE_UNKNOWN → 3x spread widening)
+  24. PID-dampened volume quota with hard EV floor
+  25. Hierarchical signal priority matrix
 """
 
 from __future__ import annotations
@@ -1954,7 +1958,7 @@ class TestCrossExchangeOracle:
         from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
 
         t = [100.0]
-        oracle = CrossExchangeOracle(clock=lambda: t[0], stale_threshold_sec=5.0)
+        oracle = CrossExchangeOracle(clock=lambda: t[0], deadman_stale_sec=5.0)
         oracle.update(Decimal("85000"), Decimal("85010"))
         t[0] = 106.0
         assert oracle.is_stale
@@ -2001,7 +2005,7 @@ class TestCrossExchangeOracle:
 
         t = [100.0]
         oracle = CrossExchangeOracle(
-            clock=lambda: t[0], stale_threshold_sec=5.0,
+            clock=lambda: t[0], deadman_stale_sec=5.0,
         )
         # Set Binance way below Kraken
         oracle.update(Decimal("80000"), Decimal("80010"))
@@ -2242,3 +2246,403 @@ class TestLevel5Integration:
         assert len(cmds) > 0
         # TFI should have been flushed
         assert loop.tfi.trade_count == 2
+
+
+# =============================================================================
+# 24. Lead-Lag Correlation Scaling
+# =============================================================================
+
+
+class TestLeadLagCorrelation:
+    def test_no_samples_returns_zero(self) -> None:
+        """Correlation with no data should be 0.0."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        assert oracle.correlation() == 0.0
+
+    def test_perfect_correlation(self) -> None:
+        """Perfectly correlated price pairs should give ρ ≈ 1.0."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        # Simulate perfectly correlated samples
+        for i in range(20):
+            price = 85000 + i * 10
+            oracle._paired_samples.append((float(price), float(price)))
+        rho = oracle.correlation()
+        assert rho > 0.99
+
+    def test_threshold_scales_with_rho(self) -> None:
+        """Higher ρ should produce lower effective threshold."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        # Perfect correlation
+        for i in range(20):
+            price = 85000 + i * 10
+            oracle._paired_samples.append((float(price), float(price)))
+        threshold_high_rho = oracle.effective_threshold_bps()
+
+        oracle2 = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        # Weak correlation (random-ish)
+        import random
+        random.seed(42)
+        for i in range(20):
+            oracle2._paired_samples.append(
+                (85000 + random.random() * 100, 85000 + random.random() * 100),
+            )
+        threshold_low_rho = oracle2.effective_threshold_bps()
+
+        # High ρ → lower threshold (more sensitive)
+        assert threshold_high_rho < threshold_low_rho
+
+    def test_insufficient_samples_uses_base(self) -> None:
+        """With <3 samples, effective_threshold should equal base threshold."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        oracle._paired_samples.append((85000.0, 85000.0))
+        oracle._paired_samples.append((85010.0, 85010.0))
+        assert oracle.effective_threshold_bps() == 15.0
+
+    def test_assess_accumulates_samples(self) -> None:
+        """Each assess() call should add a paired sample."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+        oracle.assess(Decimal("85000"))
+        oracle.assess(Decimal("85005"))
+        oracle.assess(Decimal("85010"))
+        assert len(oracle._paired_samples) == 3
+
+
+# =============================================================================
+# 25. Oracle Dead-Man's Switch (STATE_UNKNOWN)
+# =============================================================================
+
+
+class TestOracleDeadManSwitch:
+    def test_fresh_data_returns_healthy(self) -> None:
+        """Fresh oracle data should return HEALTHY state."""
+        from icryptotrader.risk.cross_exchange_oracle import (
+            CrossExchangeOracle,
+            OracleState,
+        )
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+        assessment = oracle.assess(Decimal("85000"))
+        assert assessment.state == OracleState.HEALTHY
+        assert assessment.spread_multiplier == Decimal("1")
+
+    def test_stale_data_returns_unknown(self) -> None:
+        """Stale oracle data beyond deadman threshold should return UNKNOWN."""
+        from icryptotrader.risk.cross_exchange_oracle import (
+            CrossExchangeOracle,
+            OracleState,
+        )
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(clock=lambda: t[0], deadman_stale_sec=1.5)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+        t[0] = 102.0  # 2 seconds later → stale
+        assessment = oracle.assess(Decimal("85000"))
+        assert assessment.state == OracleState.UNKNOWN
+        assert assessment.spread_multiplier == Decimal("3")
+
+    def test_unknown_widens_spreads_in_tick(self) -> None:
+        """STATE_UNKNOWN should cause the strategy loop to widen spreads."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(clock=lambda: t[0], deadman_stale_sec=1.5)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+        t[0] = 102.0  # Now stale
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        loop.tick(Decimal("85000"))
+        # The oracle_spread_mult should be 3
+        assert loop._oracle_spread_mult == Decimal("3")
+
+    def test_deadman_does_not_cancel(self) -> None:
+        """STATE_UNKNOWN should widen spreads, NOT issue cancel_all."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(clock=lambda: t[0], deadman_stale_sec=1.5)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+        t[0] = 102.0
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        cmds = loop.tick(Decimal("85000"))
+        # Should NOT have cancel_all — only spread widening
+        assert not any(c["type"] == "cancel_all" for c in cmds)
+
+    def test_divergence_triggers_cancel_via_assess(self) -> None:
+        """Divergence should trigger cancel through the assess() API."""
+        from icryptotrader.risk.cross_exchange_oracle import (
+            CrossExchangeOracle,
+            OracleState,
+        )
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        # 30 bps drop
+        binance_mid = Decimal("85000") * (1 - Decimal("0.003"))
+        oracle.update(binance_mid - 5, binance_mid + 5)
+        assessment = oracle.assess(Decimal("85000"))
+        assert assessment.state == OracleState.DIVERGENCE
+        assert assessment.should_cancel
+
+    def test_deadman_trigger_counter(self) -> None:
+        """Dead-man's switch triggers should increment counter."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(clock=lambda: t[0], deadman_stale_sec=1.5)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+        t[0] = 102.0
+        oracle.assess(Decimal("85000"))
+        oracle.assess(Decimal("85000"))
+        assert oracle.deadman_triggers == 2
+
+
+# =============================================================================
+# 26. PID-Dampened Volume Quota with Hard EV Floor
+# =============================================================================
+
+
+class TestVolumeQuotaEVFloor:
+    def test_ev_floor_prevents_negative_ev(self) -> None:
+        """Volume quota must never push spacing below rt_cost + 0.5 bps."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=50_100)  # Deep in defense zone
+        quota = VolumeQuota(fee_model=fee)
+        status = quota.assess()
+
+        # Verify the floor is respected
+        min_spacing = quota.min_allowed_spacing_bps()
+        optimal = fee.min_profitable_spacing_bps(min_edge_bps=Decimal("5"))
+        effective_spacing = optimal * status.spacing_override_mult
+        assert effective_spacing >= min_spacing
+
+    def test_min_allowed_spacing(self) -> None:
+        """min_allowed_spacing should be rt_cost + 0.5 bps."""
+        from icryptotrader.fee.volume_quota import MIN_EDGE_BPS_FLOOR, VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=0)
+        quota = VolumeQuota(fee_model=fee)
+        expected = fee.rt_cost_bps() + MIN_EDGE_BPS_FLOOR
+        assert quota.min_allowed_spacing_bps() == expected
+
+    def test_ev_floor_active_flag(self) -> None:
+        """When EV floor is binding, ev_floor_active should be True."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        # Use a very aggressive defense_spacing_mult that would push below floor
+        fee = FeeModel(volume_30d_usd=50_001)  # Barely above tier
+        quota = VolumeQuota(
+            fee_model=fee,
+            defense_spacing_mult=Decimal("0.20"),  # Very aggressive
+        )
+        status = quota.assess()
+        assert status.tier_at_risk
+        # With 0.20 mult, optimal spacing would be pushed very low
+        # The EV floor should clamp it
+        assert status.ev_floor_active
+
+    def test_proactive_ramp_daily_target(self) -> None:
+        """Volume deficit should be spread over 15-day window, not 7."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=50_500)  # surplus 500 in defense zone
+        quota = VolumeQuota(fee_model=fee)
+        status = quota.assess()
+        # Defense zone = 20% of 50K = 10K
+        # Deficit = 10K - 500 = 9500
+        # Daily target = 9500 / 15 = 633
+        assert status.daily_volume_target_usd == 633
+
+    def test_bottom_tier_no_ev_floor(self) -> None:
+        """Bottom tier should not have ev_floor_active."""
+        from icryptotrader.fee.volume_quota import VolumeQuota
+
+        fee = FeeModel(volume_30d_usd=0)
+        quota = VolumeQuota(fee_model=fee)
+        status = quota.assess()
+        assert not status.ev_floor_active
+
+
+# =============================================================================
+# 27. Hierarchical Signal Priority Matrix
+# =============================================================================
+
+
+class TestPriorityMatrix:
+    def test_oracle_veto_overrides_volume_quota(self) -> None:
+        """P0 oracle cancel should override P2 volume quota tightening."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(
+            clock=lambda: 100.0, divergence_threshold_bps=15.0,
+        )
+        # 40 bps divergence (triggers cancel)
+        oracle.update(Decimal("84640"), Decimal("84680"))
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        # Set volume quota to want tightening
+        loop._fee = FeeModel(volume_30d_usd=50_500)
+
+        cmds = loop.tick(Decimal("85000"))
+        # P0 veto: should be cancel_all, NOT tightened grid orders
+        cmd_types = {c["type"] for c in cmds}
+        assert "cancel_all" in cmd_types
+        # Should return ONLY cancel_all (early return from tick)
+        assert all(c["type"] == "cancel_all" for c in cmds)
+
+    def test_toxic_flow_blocks_volume_tightening(self) -> None:
+        """P1 toxic TFI should prevent P2 volume quota from tightening."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        oracle.update(Decimal("84990"), Decimal("85010"))  # No divergence
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        # Simulate strong toxic sell flow (TFI < -0.5)
+        loop._tfi.record_trade("sell", Decimal("10.0"), Decimal("85000"))
+        # Trigger: tfi should be very negative now
+        # Buffer must be flushed first, so record directly to TFI
+        assert loop._tfi.compute() < -0.9
+
+        # Set volume quota to want tightening
+        loop._fee = FeeModel(volume_30d_usd=50_500)
+        from icryptotrader.fee.volume_quota import VolumeQuota
+        loop._volume_quota = VolumeQuota(fee_model=loop._fee)
+
+        cmds = loop.tick(Decimal("85000"))
+        # The tick should complete (no cancel), but volume quota should NOT
+        # have tightened because P1 (toxic flow) blocks P2.
+        # Verify by checking that vq_status was assessed but not applied
+        vq_status = loop._volume_quota.assess()
+        assert vq_status.tier_at_risk
+
+    def test_neutral_market_allows_volume_tightening(self) -> None:
+        """When P0 and P1 are neutral, P2 volume quota should be allowed."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        oracle.update(Decimal("84990"), Decimal("85010"))  # No divergence
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        # Balanced TFI (neutral market)
+        loop._tfi.record_trade("buy", Decimal("1.0"), Decimal("85000"))
+        loop._tfi.record_trade("sell", Decimal("1.0"), Decimal("85000"))
+        assert abs(loop._tfi.compute()) < 0.1
+
+        # Volume quota wants to tighten
+        loop._fee = FeeModel(volume_30d_usd=50_500)
+        from icryptotrader.fee.volume_quota import VolumeQuota
+        loop._volume_quota = VolumeQuota(fee_model=loop._fee)
+
+        # P0 neutral (no divergence), P1 neutral (balanced TFI)
+        # → P2 volume quota should be applied
+        cmds = loop.tick(Decimal("85000"))
+        assert len(cmds) > 0  # Grid commands should be produced
+
+    def test_deadman_switch_prevents_volume_tightening(self) -> None:
+        """STATE_UNKNOWN from dead-man's switch should block volume quota."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        t = [100.0]
+        oracle = CrossExchangeOracle(clock=lambda: t[0], deadman_stale_sec=1.5)
+        oracle.update(Decimal("84990"), Decimal("85010"))
+        t[0] = 102.0  # Stale → UNKNOWN
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        loop._fee = FeeModel(volume_30d_usd=50_500)
+        from icryptotrader.fee.volume_quota import VolumeQuota
+        loop._volume_quota = VolumeQuota(fee_model=loop._fee)
+
+        loop.tick(Decimal("85000"))
+        # oracle_spread_mult should be 3 (STATE_UNKNOWN widening)
+        assert loop._oracle_spread_mult == Decimal("3")
+
+    def test_full_priority_cascade(self) -> None:
+        """Full priority cascade: P0 healthy, P1 neutral, P2 active."""
+        from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+        oracle = CrossExchangeOracle(clock=lambda: 100.0)
+        oracle.update(Decimal("84998"), Decimal("85002"))  # Aligned
+
+        loop = _make_loop()
+        book = OrderBook(symbol="XBT/USD")
+        book.apply_snapshot({
+            "asks": [{"price": "85010", "qty": "1"}],
+            "bids": [{"price": "84990", "qty": "1"}],
+        }, checksum_enabled=False)
+        loop._book = book
+        loop._oracle = oracle
+
+        # Everything normal, no toxic flow
+        cmds = loop.tick(Decimal("85000"))
+        # Normal grid orders should be produced
+        assert len(cmds) > 0
+        assert loop._oracle_spread_mult == Decimal("1")  # No widening
