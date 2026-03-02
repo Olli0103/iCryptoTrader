@@ -48,8 +48,10 @@ if TYPE_CHECKING:
     from icryptotrader.ws.book_manager import OrderBook
 
 from icryptotrader.fee.fee_model import FeeModel  # noqa: TC001
+from icryptotrader.fee.volume_quota import VolumeQuota
 from icryptotrader.inventory.inventory_arbiter import InventoryArbiter  # noqa: TC001
 from icryptotrader.order.order_manager import Action, DesiredLevel, OrderManager
+from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
 from icryptotrader.risk.delta_skew import DeltaSkew  # noqa: TC001
 from icryptotrader.risk.hedge_manager import HedgeAction  # noqa: TC001
 from icryptotrader.risk.mark_out_tracker import MarkOutTracker
@@ -123,6 +125,7 @@ class StrategyLoop:
         persistence_backend: str = "json",
         book: OrderBook | None = None,
         avellaneda_stoikov: AvellanedaStoikov | None = None,
+        cross_exchange_oracle: CrossExchangeOracle | None = None,
     ) -> None:
         self._fee = fee_model
         self._om = order_manager
@@ -166,6 +169,23 @@ class StrategyLoop:
 
         # Cross-connection heartbeat: tracks whether WS1 data is stale.
         self._ws1_stale_cancel_sent = False
+
+        # Cross-exchange oracle: monitors Binance for toxic flow detection.
+        # When Binance mid-price drops sharply below Kraken mid, HFTs will
+        # sweep our resting bids ~50-100ms later. Preemptive cancel protects.
+        self._oracle = cross_exchange_oracle
+        self._oracle_cancel_sent = False
+
+        # Volume Quota: prevents fee-tier death spiral when mark-out tracker
+        # forces wider spreads → lower fill rate → lower 30-day volume →
+        # higher fees → even wider spreads.
+        self._volume_quota = VolumeQuota(fee_model=fee_model)
+
+        # Trade event buffer: holds public trades until the next tick when
+        # the L2 book is confirmed fresh. Prevents acting on TFI signal
+        # computed from a trade that caused a book update we haven't yet
+        # received (WS trade vs book event race condition).
+        self._trade_buffer: list[tuple[str, Decimal, Decimal]] = []
 
         # Debounced ledger persistence: single-thread executor + dirty flag.
         # Prevents thread-pool starvation during burst fills (flash crashes
@@ -212,14 +232,27 @@ class StrategyLoop:
         """Mark-out tracker (for external wiring)."""
         return self._mark_out
 
+    @property
+    def oracle(self) -> CrossExchangeOracle | None:
+        """Cross-exchange oracle (for external wiring)."""
+        return self._oracle
+
+    @property
+    def volume_quota(self) -> VolumeQuota:
+        """Volume quota monitor (for external wiring)."""
+        return self._volume_quota
+
     def record_public_trade(
         self, side: str, qty: Decimal, price: Decimal,
     ) -> None:
-        """Record a public trade from the Kraken trade channel.
+        """Buffer a public trade from the Kraken trade channel.
 
-        Called by the __main__ trade callback to feed the TFI tracker.
+        Trades are buffered until the next tick when the L2 book is confirmed
+        fresh.  This prevents the WS event race where a large taker trade
+        triggers a TFI update before the corresponding book update arrives,
+        causing the grid to be recalculated against a stale book state.
         """
-        self._tfi.record_trade(side=side, qty=qty, price=price)
+        self._trade_buffer.append((side, qty, price))
 
     def set_eur_usd_rate(self, rate: Decimal) -> None:
         """Update EUR/USD rate from ECB service."""
@@ -351,12 +384,47 @@ class StrategyLoop:
                 logger.info("WS1 recovered (age=%.1fs), resuming", ws1_age)
                 self._ws1_stale_cancel_sent = False
 
-        # 0b. Mark-out tracker: check pending fills for T+X price marks.
+        # 0b. Flush buffered public trades into TFI now that the book is
+        # up-to-date.  This fixes the WS event race: a taker trade arrives
+        # before the corresponding L2 book update, so we must not process
+        # the TFI signal until the book reflects the trade's impact.
+        if self._trade_buffer:
+            for side, qty, price in self._trade_buffer:
+                self._tfi.record_trade(side=side, qty=qty, price=price)
+            self._trade_buffer.clear()
+
+        # 0c. Mark-out tracker: check pending fills for T+X price marks.
         if self._book is not None and self._book.is_valid:
             self._mark_out.check_mark_outs(self._book.mid_price)
 
+        # 0d. Cross-exchange oracle: if Binance mid-price has dropped sharply
+        # below Kraken mid, HFT arbitrageurs will sweep our resting bids
+        # within ~50-100ms. Issue preemptive cancel_all before they arrive.
+        if (
+            self._oracle is not None
+            and self._book is not None
+            and self._book.is_valid
+        ):
+            if self._oracle.should_preemptive_cancel(self._book.mid_price):
+                if not self._oracle_cancel_sent:
+                    logger.warning(
+                        "Cross-exchange oracle: preemptive cancel_all "
+                        "(Binance mid=%.2f, Kraken mid=%.2f)",
+                        self._oracle.binance_mid, self._book.mid_price,
+                    )
+                    commands.append({"type": "cancel_all", "slot_id": -1, "params": {}})
+                    self._oracle_cancel_sent = True
+                    self.last_tick_duration_ms = (time.monotonic() - tick_start) * 1000
+                    self._record_tick_metrics()
+                    return commands
+            elif self._oracle_cancel_sent:
+                # Oracle divergence resolved
+                logger.info("Cross-exchange oracle: divergence resolved, resuming")
+                self._oracle_cancel_sent = False
+
         # 1. Update market data
         self._inv.update_price(mid_price)
+        self._inv.update_deviation_tracker()
         self._regime.update_price(mid_price)
 
         # Track price history for 1h/24h change calculations.
@@ -467,15 +535,26 @@ class StrategyLoop:
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
         fee_floor = self._grid.optimal_spacing_bps()
 
+        # Volume Quota: when 30-day volume is close to dropping a fee tier,
+        # tighten the fee floor to generate volume and prevent the death
+        # spiral (wider spreads → less volume → higher fees → wider spreads).
+        vq_status = self._volume_quota.assess()
+        if vq_status.tier_at_risk:
+            fee_floor = fee_floor * vq_status.spacing_override_mult
+
         # Avellaneda-Stoikov: when enabled, computes optimal spread and
         # inventory skew in one model, replacing Bollinger + DeltaSkew.
         if self._as is not None:
             inv_delta = snap.btc_allocation_pct - limits.target_pct
+            # Time-decay: scale inventory delta by duration-based urgency
+            # multiplier so long-held deviations produce stronger mean-reversion.
+            td_mult = self._inv.time_decay_multiplier()
             as_result = self._as.compute(
                 volatility_bps=Decimal(str(self._regime.ewma_volatility * 10000)),
                 inventory_delta=Decimal(str(inv_delta)),
                 fee_floor_bps=fee_floor,
                 obi=obi,
+                time_decay_mult=td_mult,
             )
             base_spacing = as_result.buy_spacing_bps
             buy_spacing = as_result.buy_spacing_bps
@@ -686,6 +765,10 @@ class StrategyLoop:
                 qty=fill_qty,
                 mid_price=mid,
             )
+
+        # Record fill volume for Volume Quota tier-defense tracking.
+        if fill_price > 0 and fill_qty > 0:
+            self._volume_quota.record_fill_volume(fill_price * fill_qty)
 
         # Record fill in metrics
         if self._metrics:

@@ -234,6 +234,11 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
 
     order_book = OrderBook(symbol=cfg.pair)
 
+    # Cross-exchange oracle (Binance bookTicker for toxic flow detection)
+    from icryptotrader.risk.cross_exchange_oracle import CrossExchangeOracle
+
+    cross_exchange_oracle = CrossExchangeOracle()
+
     # Strategy loop
     strategy_loop = StrategyLoop(
         fee_model=fee_model,
@@ -255,6 +260,7 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         persistence_backend=persistence_backend,
         book=order_book,
         avellaneda_stoikov=as_model,
+        cross_exchange_oracle=cross_exchange_oracle,
     )
 
     # P0-1: Wire fill callback so FIFO ledger is updated on every fill
@@ -304,6 +310,7 @@ def _build_components(cfg: Config) -> dict:  # type: ignore[type-arg]
         "web_dashboard": web_dashboard,
         "pair_manager": pair_manager,
         "order_book": order_book,
+        "cross_exchange_oracle": cross_exchange_oracle,
     }
 
 
@@ -362,6 +369,10 @@ async def _run_bot(cfg: Config) -> None:
         lifecycle_manager=lm,
     )
     watchdog_task = asyncio.create_task(watchdog.run())
+
+    # Cross-exchange oracle: Binance bookTicker for toxic flow detection
+    oracle = c["cross_exchange_oracle"]
+    oracle_task = asyncio.create_task(oracle.run())
 
     # Start WS connections
     ws_public_task = asyncio.create_task(ws_public.run())
@@ -521,8 +532,10 @@ async def _run_bot(cfg: Config) -> None:
     # Shutdown
     logger.info("Shutting down...")
     watchdog.stop()
+    oracle.stop()
 
     ecb_task.cancel()
+    oracle_task.cancel()
     if ai_task:
         ai_task.cancel()
     if web_dashboard:
@@ -535,10 +548,11 @@ async def _run_bot(cfg: Config) -> None:
     await lm.shutdown()
 
     watchdog_task.cancel()
+    oracle_task.cancel()
     ws_public_task.cancel()
     ws_private_task.cancel()
 
-    for task in (watchdog_task, ws_public_task, ws_private_task):
+    for task in (watchdog_task, oracle_task, ws_public_task, ws_private_task):
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
