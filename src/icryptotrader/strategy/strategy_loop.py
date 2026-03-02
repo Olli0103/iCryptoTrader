@@ -114,6 +114,13 @@ class StrategyLoop:
     _ZOMBIE_SWEEP_INTERVAL_SEC = 3600.0  # 1 hour
     _ZOMBIE_SIGMA_THRESHOLD = 3.0  # cancel if > 3σ from mid
 
+    # REST Audit Loop: periodic REST-based reconciliation catches phantom
+    # fills — trades that executed on the exchange but whose WS execution
+    # event was dropped (Kafka backpressure, UDP loss).  Without this,
+    # OrderManager believes a filled order is still LIVE, the FIFO ledger
+    # never records the trade, and the bot holds risk it doesn't know about.
+    _REST_AUDIT_INTERVAL_SEC = 900.0  # 15 minutes
+
     def __init__(
         self,
         fee_model: FeeModel,
@@ -227,6 +234,11 @@ class StrategyLoop:
         # Zombie grid sweep: tracks last sweep time and cancelled count
         self._last_zombie_sweep_ts: float = 0.0
         self.zombie_cancels: int = 0
+
+        # REST Audit Loop: periodic reconciliation against exchange REST API
+        self._last_rest_audit_ts: float = 0.0
+        self.rest_audit_count: int = 0
+        self.phantom_fills_injected: int = 0
 
         # Metrics
         self.ticks: int = 0
@@ -834,6 +846,55 @@ class StrategyLoop:
                 len(commands), vol, threshold_price,
             )
         return commands
+
+    def rest_audit(
+        self,
+        open_orders: list[dict[str, Any]],
+        recent_trades: list[dict[str, Any]],
+    ) -> list[str]:
+        """Periodic REST-based reconciliation against exchange state.
+
+        Called every ``_REST_AUDIT_INTERVAL_SEC`` (15 min) with data from
+        Kraken REST ``/0/private/OpenOrders`` and ``/0/private/TradesHistory``.
+
+        This catches "phantom fills" — trades that executed on the exchange
+        but whose WS execution event was dropped due to Kafka backpressure
+        or network loss.  Without this, OrderManager believes a filled order
+        is still LIVE, the FIFO ledger never records the trade, and the bot
+        holds risk it doesn't know about.
+
+        Args:
+            open_orders: List of open order dicts from Kraken REST API.
+            recent_trades: List of recent trade dicts from Kraken REST API.
+
+        Returns:
+            List of orphan order IDs that should be cancelled.
+        """
+        now = time.monotonic()
+        if now - self._last_rest_audit_ts < self._REST_AUDIT_INTERVAL_SEC:
+            return []
+        self._last_rest_audit_ts = now
+        self.rest_audit_count += 1
+
+        pre_fills = self.fills_today
+        orphan_ids = self._om.reconcile_snapshot(open_orders, recent_trades)
+        injected = self.fills_today - pre_fills
+
+        if injected > 0:
+            self.phantom_fills_injected += injected
+            logger.warning(
+                "REST audit #%d: injected %d phantom fills into FIFO ledger",
+                self.rest_audit_count, injected,
+            )
+            # Force a ledger save after discovering phantom fills
+            self.save_ledger()
+        else:
+            logger.info(
+                "REST audit #%d: state consistent (%d open orders, %d recent trades)",
+                self.rest_audit_count, len(open_orders), len(recent_trades),
+            )
+
+        return orphan_ids
 
     def on_fill(self, slot: Any, fill_data: dict[str, Any]) -> None:
         """Handle a fill event — update FIFO ledger.
