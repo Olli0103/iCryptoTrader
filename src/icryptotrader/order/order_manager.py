@@ -46,6 +46,14 @@ DEFAULT_PRICE_EPSILON = Decimal("0.1")
 # 10 bps is wide enough to preserve queue position while still tracking the market.
 DEFAULT_AMEND_THRESHOLD_BPS = Decimal("10")
 
+# Post-only rejection backoff parameters.
+# When a limit order with post_only=True crosses the spread, Kraken rejects it.
+# Without backoff, the bot would re-place the same order every tick (~100ms),
+# burning through API rate limits at 10 req/s and risking an IP ban.
+_REJECT_BACKOFF_BASE_SEC = 0.2  # Initial backoff: 200ms
+_REJECT_BACKOFF_MAX_SEC = 5.0  # Cap at 5 seconds
+_REJECT_BACKOFF_RESET_AFTER_SEC = 10.0  # Reset counter after 10s of no rejections
+
 
 @dataclass
 class DesiredLevel:
@@ -80,6 +88,11 @@ class OrderSlot:
 
     # Desired state from last strategy tick (for reconciliation)
     desired: DesiredLevel | None = None
+
+    # Post-only rejection backoff: prevents infinite cancel/replace loops
+    # when the market moves too fast and limit orders would cross the spread.
+    reject_count: int = 0
+    reject_backoff_until: float = 0.0  # monotonic timestamp
 
     def remaining_qty(self) -> Decimal:
         return self.qty - self.filled_qty
@@ -158,6 +171,7 @@ class OrderManager:
         self.orders_filled: int = 0
         self.amend_rejects: int = 0
         self.timeout_cancels: int = 0
+        self.post_only_rejects: int = 0
 
     @property
     def slots(self) -> list[OrderSlot]:
@@ -183,6 +197,11 @@ class OrderManager:
         # EMPTY slot
         if slot.state == SlotState.EMPTY:
             if desired is not None:
+                # Post-only rejection backoff: if this slot was recently
+                # rejected, wait until the backoff period expires before
+                # attempting to place again.
+                if slot.reject_backoff_until > 0 and now < slot.reject_backoff_until:
+                    return Action.Noop()
                 return Action.AddOrder(desired.price, desired.qty, desired.side)
             return Action.Noop()
 
@@ -317,6 +336,9 @@ class OrderManager:
             slot.state = SlotState.LIVE
             slot.order_id = order_id
             self._order_id_to_slot[order_id] = slot
+            # Reset rejection backoff on success
+            slot.reject_count = 0
+            slot.reject_backoff_until = 0.0
             logger.info(
                 "Slot %d: LIVE order_id=%s price=%s qty=%s %s",
                 slot.slot_id, order_id, slot.price, slot.qty, slot.side.value,
@@ -324,7 +346,20 @@ class OrderManager:
         else:
             slot.state = SlotState.EMPTY
             slot.order_id = ""
-            logger.error("Slot %d: add_order rejected: %s", slot.slot_id, error)
+            # Exponential backoff for post_only rejections.
+            # Prevents the infinite cancel/replace loop at 10 req/s that
+            # exhausts Kraken's rate limit during fast market moves.
+            slot.reject_count += 1
+            backoff_sec = min(
+                _REJECT_BACKOFF_BASE_SEC * (2 ** (slot.reject_count - 1)),
+                _REJECT_BACKOFF_MAX_SEC,
+            )
+            slot.reject_backoff_until = time.monotonic() + backoff_sec
+            self.post_only_rejects += 1
+            logger.warning(
+                "Slot %d: add_order rejected: %s (backoff %.1fs, reject #%d)",
+                slot.slot_id, error, backoff_sec, slot.reject_count,
+            )
             self._cleanup_slot_maps(slot)
 
     def on_amend_order_ack(self, order_id: str, success: bool, error: str = "") -> None:
@@ -372,12 +407,18 @@ class OrderManager:
         """Handle an execution event from the executions channel.
 
         Execution events include: new, trade (fill), restated (amend), canceled.
+
+        Out-of-order handling: In crypto WS streams, a trade (fill) event
+        can arrive *before* the new (order accepted) event. The state machine
+        must handle this by mapping via cl_ord_id and allowing PENDING_NEW
+        orders to transition directly to EMPTY (filled) or remain LIVE
+        (partial fill) without requiring the ack first.
         """
         exec_type = exec_data.get("exec_type", "")
         order_id = exec_data.get("order_id", "")
         cl_ord_id = exec_data.get("cl_ord_id", "")
 
-        # Find the slot
+        # Find the slot — try order_id first, then cl_ord_id
         slot = self._order_id_to_slot.get(order_id)
         if slot is None and cl_ord_id:
             slot = self._cl_ord_id_to_slot.get(cl_ord_id)
@@ -393,8 +434,25 @@ class OrderManager:
         elif exec_type == "trade":
             # Fill (partial or full)
             if slot is None:
-                logger.warning("Fill for unknown order %s", order_id)
+                logger.warning(
+                    "Fill for unknown order order_id=%s cl_ord_id=%s — "
+                    "cannot route to any slot",
+                    order_id, cl_ord_id,
+                )
                 return
+
+            # Out-of-order fill: if the fill arrived before the ack,
+            # map the order_id now so future events route correctly.
+            if slot.state == SlotState.PENDING_NEW:
+                if order_id and not slot.order_id:
+                    slot.order_id = order_id
+                    self._order_id_to_slot[order_id] = slot
+                logger.info(
+                    "Slot %d: fill arrived before ack (out-of-order), "
+                    "order_id=%s cl_ord_id=%s",
+                    slot.slot_id, order_id, cl_ord_id,
+                )
+
             fill_qty = Decimal(str(exec_data.get("last_qty", "0")))
             fill_price = Decimal(str(exec_data.get("last_price", "0")))
             slot.filled_qty += fill_qty
@@ -409,6 +467,9 @@ class OrderManager:
                 )
                 self._cleanup_slot_maps(slot)
             else:
+                # Partial fill: if still PENDING_NEW, promote to LIVE
+                if slot.state == SlotState.PENDING_NEW:
+                    slot.state = SlotState.LIVE
                 logger.info(
                     "Slot %d: partial fill order_id=%s fill_qty=%s @ %s (filled=%s/%s)",
                     slot.slot_id, order_id, fill_qty, fill_price,

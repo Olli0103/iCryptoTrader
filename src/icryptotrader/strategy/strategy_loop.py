@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -139,6 +141,15 @@ class StrategyLoop:
         self._compound_base_usd = compound_base_usd
         self._base_order_size_usd = base_order_size_usd
 
+        # Debounced ledger persistence: single-thread executor + dirty flag.
+        # Prevents thread-pool starvation during burst fills (flash crashes
+        # can produce 50-100 fills in seconds, each of which triggers a save).
+        self._ledger_dirty = False
+        self._ledger_save_lock = threading.Lock()
+        self._ledger_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger-save")
+        self._ledger_save_pending = False  # A save task is already scheduled
+        self._ledger_debounce_sec: float = 0.5  # Coalesce saves within 500ms
+
         # High/low tracker for Bollinger ATR feed
         self._price_window: deque[Decimal] = deque(maxlen=50)
 
@@ -180,27 +191,61 @@ class StrategyLoop:
     def save_ledger(self) -> None:
         """Save FIFO ledger to disk (called automatically after fills).
 
-        When called from the async event loop, saves in a thread executor
-        to avoid blocking. Falls back to synchronous save if no loop is running.
+        Uses debounced persistence: marks ledger dirty and schedules a save
+        on a dedicated single-thread executor. Multiple fills within the
+        debounce window (500ms) are coalesced into a single disk write,
+        preventing thread pool starvation during burst fills (flash crashes).
         """
         if not self._ledger_path:
             return
+        with self._ledger_save_lock:
+            self._ledger_dirty = True
+            if self._ledger_save_pending:
+                return  # A save is already scheduled; it will pick up the dirty flag
+            self._ledger_save_pending = True
+
         try:
             loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, self._save_ledger_sync)
+            loop.call_later(self._ledger_debounce_sec, self._submit_ledger_save)
         except RuntimeError:
-            # No running loop, save synchronously
+            # No running loop — save synchronously (startup / shutdown)
             self._save_ledger_sync()
 
-    def _save_ledger_sync(self) -> None:
-        """Synchronous ledger save (used by executor and direct calls)."""
+    def save_ledger_now(self) -> None:
+        """Force an immediate synchronous ledger save (for shutdown)."""
         if not self._ledger_path:
             return
-        if self._persistence_backend == "sqlite":
-            db_path = self._ledger_path.with_suffix(".db")
-            self._ledger.save_sqlite(db_path)
-        else:
-            self._ledger.save(self._ledger_path)
+        self._save_ledger_sync()
+
+    def _submit_ledger_save(self) -> None:
+        """Submit the actual save to the dedicated single-thread executor."""
+        self._ledger_executor.submit(self._save_ledger_sync)
+
+    def _save_ledger_sync(self) -> None:
+        """Synchronous ledger save on the dedicated executor thread.
+
+        Drains the dirty flag so concurrent fills during write are coalesced
+        into the next scheduled save.
+        """
+        if not self._ledger_path:
+            return
+        with self._ledger_save_lock:
+            if not self._ledger_dirty:
+                self._ledger_save_pending = False
+                return
+            self._ledger_dirty = False
+            self._ledger_save_pending = False
+        try:
+            if self._persistence_backend == "sqlite":
+                db_path = self._ledger_path.with_suffix(".db")
+                self._ledger.save_sqlite(db_path)
+            else:
+                self._ledger.save(self._ledger_path)
+        except Exception:
+            logger.exception("Ledger save failed")
+            # Re-mark dirty so next save attempt retries
+            with self._ledger_save_lock:
+                self._ledger_dirty = True
 
     def compound_order_size(self) -> Decimal:
         """Compute current order size with auto-compounding.
@@ -298,16 +343,28 @@ class StrategyLoop:
             sell_spacing_tighten = self._hedge_action.sell_spacing_tighten_pct
 
         # 7. Compute delta skew (with OBI from book if available)
+        # Dead-band: when allocation drift is within tolerance (±2%), suppress
+        # the allocation-based skew to avoid constantly fighting trivial drift.
+        # OBI-based skew still applies (microstructure signal is always useful).
         limits = self._inv.current_limits()
         obi = 0.0
         if self._book is not None and self._book.is_valid:
             obi = self._book.order_book_imbalance()
             self._regime.update_order_book_imbalance(obi)
-        skew_result = self._skew.compute(
-            btc_alloc_pct=snap.btc_allocation_pct,
-            target_pct=limits.target_pct,
-            obi=obi,
-        )
+
+        if self._inv.is_within_dead_band():
+            # Within dead-band: zero out allocation deviation, keep OBI only
+            skew_result = self._skew.compute(
+                btc_alloc_pct=limits.target_pct,  # pretend we're at target
+                target_pct=limits.target_pct,
+                obi=obi,
+            )
+        else:
+            skew_result = self._skew.compute(
+                btc_alloc_pct=snap.btc_allocation_pct,
+                target_pct=limits.target_pct,
+                obi=obi,
+            )
 
         # 8. Compute grid levels with skewed spacings and regime-scaled sizing
         fee_floor = self._grid.optimal_spacing_bps()

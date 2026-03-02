@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import zlib
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -48,6 +49,21 @@ class OrderBook:
         self._consecutive_checksum_failures: int = 0
         self.checksum_failures: int = 0
         self.updates_applied: int = 0
+        self.resync_count: int = 0
+
+        # Auto-recovery callback: invoked when the book becomes invalid
+        # due to consecutive CRC32 checksum failures. The caller should
+        # wire this to drop the WS connection and trigger a full REST
+        # snapshot re-sync (e.g., re-subscribe to the book channel).
+        self._on_invalid_callbacks: list[Callable[[str], None]] = []
+
+    def on_invalid(self, callback: Callable[[str], None]) -> None:
+        """Register a callback for when the book becomes invalid.
+
+        The callback receives the symbol name as its argument.
+        Typical usage: trigger WS reconnect and request fresh snapshot.
+        """
+        self._on_invalid_callbacks.append(callback)
 
     @property
     def is_valid(self) -> bool:
@@ -128,10 +144,12 @@ class OrderBook:
                 self._consecutive_checksum_failures += 1
                 if self._consecutive_checksum_failures >= _MAX_CHECKSUM_FAILURES:
                     logger.error(
-                        "Book checksum failed %d times consecutively — marking invalid",
+                        "Book checksum failed %d times consecutively — "
+                        "clearing book and triggering auto-resync",
                         self._consecutive_checksum_failures,
                     )
-                    self._is_valid = False
+                    self.request_resync()
+                    self._notify_invalid()
                 return False
             self._consecutive_checksum_failures = 0
 
@@ -223,7 +241,16 @@ class OrderBook:
         self._is_valid = False
         self._asks.clear()
         self._bids.clear()
-        logger.warning("Book resync requested for %s", self._symbol)
+        self.resync_count += 1
+        logger.warning("Book resync requested for %s (resync #%d)", self._symbol, self.resync_count)
+
+    def _notify_invalid(self) -> None:
+        """Invoke all registered on_invalid callbacks."""
+        for cb in self._on_invalid_callbacks:
+            try:
+                cb(self._symbol)
+            except Exception:
+                logger.exception("on_invalid callback error for %s", self._symbol)
 
     def _validate_checksum(self, expected: int) -> bool:
         """Validate our computed checksum against Kraken's."""

@@ -14,6 +14,7 @@ the fee-model minimum and capped at a configurable maximum.
 from __future__ import annotations
 
 import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
@@ -55,6 +56,8 @@ class BollingerSpacing:
         atr_enabled: bool = True,
         atr_window: int = 14,
         atr_weight: float = 0.3,
+        sample_interval_sec: float = 0.0,
+        clock: object | None = None,
     ) -> None:
         self._window = max(2, window)
         self._multiplier = multiplier
@@ -63,6 +66,19 @@ class BollingerSpacing:
         self._max_spacing_bps = max_spacing_bps
         self._prices: deque[Decimal] = deque(maxlen=self._window)
         self._state: BollingerState | None = None
+
+        # Time-gated sampling: only record one observation per interval.
+        # Without this, a 100ms tick loop with window=20 would compute
+        # Bollinger bands over ~2 seconds of data — statistically meaningless
+        # for grid spacing that targets hours-long mean reversion.
+        # Set sample_interval_sec=60 for 1-minute candles (recommended).
+        # Set sample_interval_sec=0 to disable time-gating (legacy behaviour).
+        self._sample_interval_sec = max(0.0, sample_interval_sec)
+        self._clock = clock  # Injectable clock for testing
+        self._last_sample_time: float = 0.0
+        # Track intra-period high/low for ATR accuracy between samples
+        self._period_high: Decimal | None = None
+        self._period_low: Decimal | None = None
 
         # ATR state
         self._atr_enabled = atr_enabled
@@ -96,6 +112,11 @@ class BollingerSpacing:
     ) -> BollingerState | None:
         """Add a price observation and recompute bands + ATR.
 
+        When ``sample_interval_sec > 0``, raw websocket ticks are accumulated
+        but only one observation per interval is recorded into the Bollinger
+        deque.  Intra-period high/low are tracked for accurate ATR even when
+        high/low are not provided by the caller.
+
         Args:
             mid_price: Current mid/close price.
             high: Period high (if available). Defaults to mid_price.
@@ -103,14 +124,37 @@ class BollingerSpacing:
 
         Returns the new state, or None if the window is not yet full.
         """
+        now = self._clock() if callable(self._clock) else time.monotonic()
+
+        # Track running high/low for ATR accuracy within the sample period
+        effective_high = high if high is not None else mid_price
+        effective_low = low if low is not None else mid_price
+        if self._period_high is None or effective_high > self._period_high:
+            self._period_high = effective_high
+        if self._period_low is None or effective_low < self._period_low:
+            self._period_low = effective_low
+
+        # Time-gated sampling: skip until the interval elapses
+        if self._sample_interval_sec > 0 and self._last_sample_time > 0:
+            elapsed = now - self._last_sample_time
+            if elapsed < self._sample_interval_sec:
+                # Not yet time for a new sample — return cached state
+                return self._state
+
+        # Record this observation
+        self._last_sample_time = now
         self._prices.append(mid_price)
 
-        # Track high/low/close for ATR
+        # Track high/low/close for ATR using accumulated period extremes
         if self._atr_enabled:
-            self._highs.append(high if high is not None else mid_price)
-            self._lows.append(low if low is not None else mid_price)
+            self._highs.append(self._period_high)
+            self._lows.append(self._period_low)
             self._closes.append(mid_price)
             self._compute_atr()
+
+        # Reset period tracking for next interval
+        self._period_high = None
+        self._period_low = None
 
         if len(self._prices) < self._window:
             self._state = None
@@ -202,3 +246,6 @@ class BollingerSpacing:
         self._closes.clear()
         self._state = None
         self._atr_value = None
+        self._last_sample_time = 0.0
+        self._period_high = None
+        self._period_low = None
