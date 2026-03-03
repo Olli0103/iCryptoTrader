@@ -121,6 +121,17 @@ class StrategyLoop:
     # never records the trade, and the bot holds risk it doesn't know about.
     _REST_AUDIT_INTERVAL_SEC = 900.0  # 15 minutes
 
+    # Asymmetric Post-Trade Cooldown: after a bid fill, enforce a mandatory
+    # buy-side lockout before allowing new bids.  During a toxic liquidation
+    # cascade, TFI spikes negative (heavy taker selling) and the grid would
+    # otherwise systematically reload bids all the way down, consuming the
+    # entire USD reserve catching a falling knife.  The cooldown scales with
+    # TFI toxicity: calm market → 2s base cooldown, toxic flow → up to 30s.
+    _BUY_COOLDOWN_BASE_SEC = 2.0
+    _BUY_COOLDOWN_MAX_SEC = 30.0
+    _SELL_COOLDOWN_BASE_SEC = 1.0
+    _SELL_COOLDOWN_MAX_SEC = 15.0
+
     def __init__(
         self,
         fee_model: FeeModel,
@@ -239,6 +250,14 @@ class StrategyLoop:
         self._last_rest_audit_ts: float = 0.0
         self.rest_audit_count: int = 0
         self.phantom_fills_injected: int = 0
+
+        # Asymmetric Post-Trade Cooldown: monotonic timestamp of last fill
+        # per side.  Cooldown duration scales with TFI toxicity to prevent
+        # the grid from catching a falling knife during liquidation cascades.
+        self._last_buy_fill_ts: float = 0.0
+        self._last_sell_fill_ts: float = 0.0
+        self.buy_cooldowns_applied: int = 0
+        self.sell_cooldowns_applied: int = 0
 
         # Metrics
         self.ticks: int = 0
@@ -700,8 +719,14 @@ class StrategyLoop:
 
             # Check allocation before issuing buys
             if level is not None and level.side == Side.BUY:
+                # Asymmetric post-trade cooldown: block new bids while
+                # in cooldown after a recent buy fill.  Prevents the grid
+                # from catching a falling knife during liquidation cascades.
+                if self.is_buy_cooled_down():
+                    self.buy_cooldowns_applied += 1
+                    level = None
                 # §42 AO: block buys during wash sale cooldown after harvest
-                if self._tax.is_buy_blocked_by_wash_sale():
+                elif self._tax.is_buy_blocked_by_wash_sale():
                     level = None
                 else:
                     allowed = self._inv.check_buy(level.qty)
@@ -714,13 +739,19 @@ class StrategyLoop:
 
             # Check allocation before issuing sells
             if level is not None and level.side == Side.SELL:
-                allowed = self._inv.check_sell(level.qty)
-                if allowed <= 0:
+                # Asymmetric post-trade cooldown: block new asks while
+                # in cooldown after a recent sell fill (short squeeze risk).
+                if self.is_sell_cooled_down():
+                    self.sell_cooldowns_applied += 1
                     level = None
-                elif allowed < level.qty:
-                    level = DesiredLevel(
-                        price=level.price, qty=allowed, side=Side.SELL,
-                    )
+                else:
+                    allowed = self._inv.check_sell(level.qty)
+                    if allowed <= 0:
+                        level = None
+                    elif allowed < level.qty:
+                        level = DesiredLevel(
+                            price=level.price, qty=allowed, side=Side.SELL,
+                        )
 
             action = self._om.decide_action(slot, level)
             cmd = self._dispatch_action(slot, action, i)
@@ -847,6 +878,44 @@ class StrategyLoop:
             )
         return commands
 
+    def buy_cooldown_sec(self) -> float:
+        """Compute current buy-side cooldown duration based on TFI toxicity.
+
+        Scales linearly from ``_BUY_COOLDOWN_BASE_SEC`` (calm) to
+        ``_BUY_COOLDOWN_MAX_SEC`` (toxic sell cascade).  TFI < 0 means
+        net taker selling — the more negative, the more toxic.
+        """
+        tfi = self._tfi.compute()
+        toxicity = max(0.0, -tfi)  # 0..1, higher = more toxic selling
+        return self._BUY_COOLDOWN_BASE_SEC + toxicity * (
+            self._BUY_COOLDOWN_MAX_SEC - self._BUY_COOLDOWN_BASE_SEC
+        )
+
+    def sell_cooldown_sec(self) -> float:
+        """Compute current sell-side cooldown duration based on TFI toxicity.
+
+        Scales with positive TFI (net taker buying = short squeeze risk).
+        """
+        tfi = self._tfi.compute()
+        toxicity = max(0.0, tfi)  # 0..1, higher = more toxic buying
+        return self._SELL_COOLDOWN_BASE_SEC + toxicity * (
+            self._SELL_COOLDOWN_MAX_SEC - self._SELL_COOLDOWN_BASE_SEC
+        )
+
+    def is_buy_cooled_down(self) -> bool:
+        """Return True if buy-side is still in post-trade cooldown."""
+        if self._last_buy_fill_ts == 0.0:
+            return False
+        elapsed = time.monotonic() - self._last_buy_fill_ts
+        return elapsed < self.buy_cooldown_sec()
+
+    def is_sell_cooled_down(self) -> bool:
+        """Return True if sell-side is still in post-trade cooldown."""
+        if self._last_sell_fill_ts == 0.0:
+            return False
+        elapsed = time.monotonic() - self._last_sell_fill_ts
+        return elapsed < self.sell_cooldown_sec()
+
     def rest_audit(
         self,
         open_orders: list[dict[str, Any]],
@@ -909,6 +978,13 @@ class StrategyLoop:
         trade_id = fill_data.get("trade_id", "")
 
         self.fills_today += 1
+
+        # Record fill timestamp for post-trade cooldown
+        now = time.monotonic()
+        if side == Side.BUY:
+            self._last_buy_fill_ts = now
+        elif side == Side.SELL:
+            self._last_sell_fill_ts = now
 
         if side == Side.BUY:
             self._ledger.add_lot(

@@ -33,6 +33,10 @@ Covers:
   30. REST Audit Loop — phantom fill reconciliation
   31. FIFO Splinter Trade — tax-lot boundary crossing
   32. Inventory Dust Deadlock — minimum trade size dead-band
+  33. Asymmetric Post-Trade Cooldown — falling knife trap prevention
+  34. Bounded Queue / TCP Buffer Bloat — OOM prevention
+  35. Cross-Collateral Tax Bomb — isolated margin enforcement
+  36. Contract-Spot Sliver Deadlock — integer basis floor
 """
 
 from __future__ import annotations
@@ -3300,3 +3304,387 @@ class TestInventoryDustDeadlock:
         # Either a valid size or 0 (dust suppressed), never a rejected dust amount
         from icryptotrader.inventory.inventory_arbiter import DUST_THRESHOLD_BTC
         assert result == Decimal("0") or result >= DUST_THRESHOLD_BTC
+
+
+# =============================================================================
+# 33. Asymmetric Post-Trade Cooldown (Falling Knife Trap)
+# =============================================================================
+
+
+class TestPostTradeCooldown:
+    """Tests for asymmetric post-trade cooldown that prevents the grid from
+    catching a falling knife during liquidation cascades."""
+
+    def test_no_cooldown_initially(self) -> None:
+        """No cooldown applied when no fills have occurred."""
+        loop = _make_loop()
+        assert not loop.is_buy_cooled_down()
+        assert not loop.is_sell_cooled_down()
+
+    def test_buy_cooldown_after_fill(self) -> None:
+        """Buy side is cooled down immediately after a buy fill."""
+        loop = _make_loop()
+        # Simulate a buy fill
+        loop._last_buy_fill_ts = time.monotonic()
+        assert loop.is_buy_cooled_down()
+        assert not loop.is_sell_cooled_down()  # sell side unaffected
+
+    def test_sell_cooldown_after_fill(self) -> None:
+        """Sell side is cooled down immediately after a sell fill."""
+        loop = _make_loop()
+        loop._last_sell_fill_ts = time.monotonic()
+        assert loop.is_sell_cooled_down()
+        assert not loop.is_buy_cooled_down()  # buy side unaffected
+
+    def test_cooldown_expires(self) -> None:
+        """Cooldown expires after the base cooldown duration in calm market."""
+        loop = _make_loop()
+        # Set fill time to well before the base cooldown
+        loop._last_buy_fill_ts = time.monotonic() - loop._BUY_COOLDOWN_BASE_SEC - 1
+        assert not loop.is_buy_cooled_down()
+
+    def test_toxic_flow_extends_buy_cooldown(self) -> None:
+        """Heavy sell pressure (negative TFI) extends buy-side cooldown."""
+        loop = _make_loop()
+        # Inject toxic sell flow: TFI = -0.8 (heavy taker selling)
+        for _ in range(100):
+            loop._tfi.record_trade("sell", Decimal("0.1"), Decimal("85000"))
+
+        cooldown = loop.buy_cooldown_sec()
+        # With high toxicity, cooldown should be much longer than base
+        assert cooldown > loop._BUY_COOLDOWN_BASE_SEC + 5.0
+        assert cooldown <= loop._BUY_COOLDOWN_MAX_SEC
+
+    def test_calm_market_uses_base_cooldown(self) -> None:
+        """In a calm market (TFI ≈ 0), use the base cooldown."""
+        loop = _make_loop()
+        # Balanced trades → TFI ≈ 0
+        loop._tfi.record_trade("buy", Decimal("0.1"), Decimal("85000"))
+        loop._tfi.record_trade("sell", Decimal("0.1"), Decimal("85000"))
+
+        cooldown = loop.buy_cooldown_sec()
+        # Should be near base cooldown (minor float variance from TFI)
+        assert cooldown < loop._BUY_COOLDOWN_BASE_SEC + 2.0
+
+    def test_cooldown_blocks_buy_in_tick(self) -> None:
+        """Buy orders are suppressed during buy-side cooldown in tick()."""
+        loop = _make_loop()
+        # First tick to set up grid state
+        loop.tick(Decimal("85000"))
+        # Simulate a very recent buy fill
+        loop._last_buy_fill_ts = time.monotonic()
+        # Now tick again — buy levels should be suppressed
+        commands = loop.tick(Decimal("85000"))
+        # Check that cooldowns were applied
+        assert loop.buy_cooldowns_applied > 0
+
+    def test_on_fill_records_buy_timestamp(self) -> None:
+        """on_fill() records the monotonic timestamp for buy fills."""
+        loop = _make_loop()
+        assert loop._last_buy_fill_ts == 0.0
+
+        slot = MagicMock()
+        slot.side = Side.BUY
+        slot.slot_id = 0
+        fill_data = {
+            "last_qty": "0.001",
+            "last_price": "85000",
+            "fee": "0.05",
+            "order_id": "test-1",
+            "trade_id": "t-1",
+        }
+        loop.on_fill(slot, fill_data)
+        assert loop._last_buy_fill_ts > 0.0
+
+    def test_on_fill_records_sell_timestamp(self) -> None:
+        """on_fill() records the monotonic timestamp for sell fills."""
+        loop = _make_loop()
+        # Need a lot to sell
+        loop._ledger.add_lot(
+            quantity_btc=Decimal("0.01"),
+            purchase_price_usd=Decimal("84000"),
+            purchase_fee_usd=Decimal("0.1"),
+            eur_usd_rate=Decimal("1.08"),
+        )
+        assert loop._last_sell_fill_ts == 0.0
+
+        slot = MagicMock()
+        slot.side = Side.SELL
+        slot.slot_id = 1
+        fill_data = {
+            "last_qty": "0.001",
+            "last_price": "86000",
+            "fee": "0.05",
+            "order_id": "test-2",
+            "trade_id": "t-2",
+        }
+        loop.on_fill(slot, fill_data)
+        assert loop._last_sell_fill_ts > 0.0
+
+    def test_constants_reasonable(self) -> None:
+        """Cooldown constants are within reasonable bounds."""
+        loop = _make_loop()
+        assert loop._BUY_COOLDOWN_BASE_SEC >= 1.0
+        assert loop._BUY_COOLDOWN_MAX_SEC <= 60.0
+        assert loop._BUY_COOLDOWN_BASE_SEC < loop._BUY_COOLDOWN_MAX_SEC
+        assert loop._SELL_COOLDOWN_BASE_SEC >= 0.5
+        assert loop._SELL_COOLDOWN_MAX_SEC <= 30.0
+        assert loop._SELL_COOLDOWN_BASE_SEC < loop._SELL_COOLDOWN_MAX_SEC
+
+
+# =============================================================================
+# 34. Bounded Queue / TCP Buffer Bloat (OOM Prevention)
+# =============================================================================
+
+
+class TestBoundedQueue:
+    """Tests for the bounded message queue in WSPublicFeed that prevents
+    OOM during black swan events."""
+
+    def test_queue_has_maxsize(self) -> None:
+        """WSPublicFeed creates a bounded asyncio.Queue."""
+        from icryptotrader.ws.ws_public import WSPublicFeed
+
+        feed = WSPublicFeed()
+        assert feed._msg_queue.maxsize > 0
+        assert feed._msg_queue.maxsize == feed._max_queue_size
+
+    def test_custom_queue_size(self) -> None:
+        """Queue size can be configured via constructor."""
+        from icryptotrader.ws.ws_public import WSPublicFeed
+
+        feed = WSPublicFeed(max_queue_size=500)
+        assert feed._msg_queue.maxsize == 500
+
+    def test_default_queue_size_is_2000(self) -> None:
+        """Default queue size matches _MAX_QUEUE_SIZE constant."""
+        from icryptotrader.ws.ws_public import WSPublicFeed, _MAX_QUEUE_SIZE
+
+        feed = WSPublicFeed()
+        assert feed._max_queue_size == _MAX_QUEUE_SIZE
+        assert _MAX_QUEUE_SIZE == 2000
+
+    def test_overflow_counter_initialized(self) -> None:
+        """Queue overflow counter starts at zero."""
+        from icryptotrader.ws.ws_public import WSPublicFeed
+
+        feed = WSPublicFeed()
+        assert feed.queue_overflows == 0
+        assert feed.msgs_dropped == 0
+
+    def test_drain_queue_empties_it(self) -> None:
+        """_drain_queue() removes all pending messages and returns count."""
+        import asyncio
+        from icryptotrader.ws.ws_public import WSPublicFeed
+
+        feed = WSPublicFeed(max_queue_size=10)
+        # Manually put items in queue
+        for i in range(5):
+            feed._msg_queue.put_nowait(f"msg_{i}")
+        assert feed._msg_queue.qsize() == 5
+        dropped = feed._drain_queue()
+        assert dropped == 5
+        assert feed._msg_queue.empty()
+
+    def test_drain_empty_queue_returns_zero(self) -> None:
+        """_drain_queue() on empty queue returns 0."""
+        from icryptotrader.ws.ws_public import WSPublicFeed
+
+        feed = WSPublicFeed()
+        assert feed._drain_queue() == 0
+
+    def test_watchdog_has_memory_ceiling(self) -> None:
+        """Watchdog has a configurable memory ceiling constant."""
+        from icryptotrader.watchdog import Watchdog
+
+        assert hasattr(Watchdog, "MEMORY_CEILING_MB")
+        assert Watchdog.MEMORY_CEILING_MB > 512  # must be > basic warning threshold
+
+    def test_watchdog_accepts_ws_public(self) -> None:
+        """Watchdog constructor accepts a ws_public parameter for queue monitoring."""
+        from icryptotrader.watchdog import Watchdog
+
+        loop = _make_loop()
+        ws_private = MagicMock()
+        ws_private.is_connected = True
+        ws_public = MagicMock()
+        ws_public._msg_queue = MagicMock()
+        ws_public._msg_queue.qsize.return_value = 0
+        ws_public._max_queue_size = 2000
+
+        wd = Watchdog(
+            strategy_loop=loop,
+            ws_private=ws_private,
+            ws_public=ws_public,
+        )
+        assert wd._ws_public is ws_public
+
+
+# =============================================================================
+# 35. Cross-Collateral Tax Bomb (Isolated Margin Enforcement)
+# =============================================================================
+
+
+class TestIsolatedMargin:
+    """Tests for the isolated margin enforcement in HedgeManager that
+    prevents cross-collateral tax bombs under §23 EStG."""
+
+    def test_default_margin_mode_is_isolated(self) -> None:
+        """HedgeManager defaults to ISOLATED margin mode."""
+        from icryptotrader.risk.hedge_manager import HedgeManager, MarginMode
+
+        hm = HedgeManager()
+        assert hm.margin_mode == MarginMode.ISOLATED
+
+    def test_cross_margin_raises_error(self) -> None:
+        """Attempting to use CROSS margin raises ValueError."""
+        import pytest
+        from icryptotrader.risk.hedge_manager import HedgeManager, MarginMode
+
+        with pytest.raises(ValueError, match="CROSS margin is prohibited"):
+            HedgeManager(margin_mode=MarginMode.CROSS)
+
+    def test_fiat_collateral_is_safe(self) -> None:
+        """USD and EUR are accepted as safe collateral."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        hm = HedgeManager()
+        assert hm.validate_collateral("USD")
+        assert hm.validate_collateral("EUR")
+        assert hm.collateral_violations == 0
+
+    def test_stablecoin_collateral_is_safe(self) -> None:
+        """USDT, USDC, DAI are accepted as safe collateral."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        hm = HedgeManager()
+        assert hm.validate_collateral("USDT")
+        assert hm.validate_collateral("USDC")
+        assert hm.validate_collateral("DAI")
+
+    def test_crypto_collateral_is_rejected(self) -> None:
+        """BTC and ETH are rejected as collateral (tax risk)."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        hm = HedgeManager()
+        assert not hm.validate_collateral("BTC")
+        assert not hm.validate_collateral("ETH")
+        assert hm.collateral_violations == 2
+
+    def test_case_insensitive_validation(self) -> None:
+        """Collateral validation is case-insensitive."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        hm = HedgeManager()
+        assert hm.validate_collateral("usd")
+        assert hm.validate_collateral("Usdt")
+        assert not hm.validate_collateral("btc")
+
+    def test_safe_collateral_types_frozen(self) -> None:
+        """SAFE_COLLATERAL_TYPES is a frozenset (immutable)."""
+        from icryptotrader.risk.hedge_manager import SAFE_COLLATERAL_TYPES
+
+        assert isinstance(SAFE_COLLATERAL_TYPES, frozenset)
+        assert "USD" in SAFE_COLLATERAL_TYPES
+        assert "BTC" not in SAFE_COLLATERAL_TYPES
+
+
+# =============================================================================
+# 36. Contract-Spot Sliver Deadlock (Integer Basis Floor)
+# =============================================================================
+
+
+class TestIntegerBasisFloor:
+    """Tests for the integer basis floor in HedgeManager that prevents
+    the sliver deadlock when hedging fractional spot delta."""
+
+    def test_exact_multiple_no_sliver(self) -> None:
+        """When delta is exact multiple of contract size, no sliver."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        contracts = HedgeManager.hedge_contracts(
+            delta_btc=Decimal("0.03"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert contracts == 3
+
+        sliver = HedgeManager.unhedgeable_sliver(
+            delta_btc=Decimal("0.03"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert sliver == Decimal("0")
+
+    def test_fractional_delta_floors_down(self) -> None:
+        """Fractional delta floors to integer contracts, leaving a sliver."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        contracts = HedgeManager.hedge_contracts(
+            delta_btc=Decimal("0.015"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert contracts == 1  # floor(0.015 / 0.01) = floor(1.5) = 1
+
+        sliver = HedgeManager.unhedgeable_sliver(
+            delta_btc=Decimal("0.015"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert sliver == Decimal("0.005")
+
+    def test_sub_contract_delta_yields_zero(self) -> None:
+        """Delta smaller than one contract yields 0 contracts."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        contracts = HedgeManager.hedge_contracts(
+            delta_btc=Decimal("0.005"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert contracts == 0
+
+        sliver = HedgeManager.unhedgeable_sliver(
+            delta_btc=Decimal("0.005"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert sliver == Decimal("0.005")
+
+    def test_zero_delta_yields_zero(self) -> None:
+        """Zero delta yields zero contracts and zero sliver."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        assert HedgeManager.hedge_contracts(Decimal("0"), Decimal("0.01")) == 0
+        assert HedgeManager.unhedgeable_sliver(Decimal("0"), Decimal("0.01")) == Decimal("0")
+
+    def test_zero_contract_size_yields_zero(self) -> None:
+        """Zero contract size is a safe no-op (no division by zero)."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        assert HedgeManager.hedge_contracts(Decimal("0.05"), Decimal("0")) == 0
+        assert HedgeManager.unhedgeable_sliver(Decimal("0.05"), Decimal("0")) == Decimal("0")
+
+    def test_large_delta_many_contracts(self) -> None:
+        """Large delta is correctly divided into many contracts."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        contracts = HedgeManager.hedge_contracts(
+            delta_btc=Decimal("1.5678"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert contracts == 156  # floor(156.78) = 156
+
+        sliver = HedgeManager.unhedgeable_sliver(
+            delta_btc=Decimal("1.5678"),
+            contract_size_btc=Decimal("0.01"),
+        )
+        assert sliver == Decimal("0.0078")
+
+    def test_usd_denominated_contracts(self) -> None:
+        """Works with USD-denominated contracts (e.g., $10/contract)."""
+        from icryptotrader.risk.hedge_manager import HedgeManager
+
+        # 1 contract = $10 USD. At BTC=$85000, that's $10/$85000 = 0.00011765 BTC
+        # If delta = 0.015 BTC = ~$1275 → 127 contracts → $1270 hedged
+        contract_btc = Decimal("10") / Decimal("85000")  # ~0.00011765
+        contracts = HedgeManager.hedge_contracts(
+            delta_btc=Decimal("0.015"),
+            contract_size_btc=contract_btc,
+        )
+        assert contracts == 127  # floor(0.015 / 0.00011765) = 127

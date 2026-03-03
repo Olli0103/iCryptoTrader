@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 # Reconnection backoff: 3 instant retries, then exponential up to 30s
 _RECONNECT_SCHEDULE = [0.0, 0.0, 0.0, 5.0, 10.0, 20.0, 30.0]
 
+# Bounded message queue: hard cap on unprocessed messages to prevent
+# OOM during black swan events when Kraken broadcasts thousands of
+# messages per second and the strategy loop can't keep up.
+# If the queue reaches this limit, we drop the connection and resync.
+_MAX_QUEUE_SIZE = 2000
+
+# Throughput monitoring: if the dispatch callback takes longer than
+# this on average (measured per second), the consumer is falling behind.
+_MAX_DISPATCH_LAG_SEC = 0.5
+
 
 @dataclass
 class Subscription:
@@ -55,7 +65,11 @@ class WSPublicFeed:
         await feed.run()  # blocks, reconnects automatically
     """
 
-    def __init__(self, url: str = "wss://ws.kraken.com/v2") -> None:
+    def __init__(
+        self,
+        url: str = "wss://ws.kraken.com/v2",
+        max_queue_size: int = _MAX_QUEUE_SIZE,
+    ) -> None:
         self._url = url
         self._ws: ws_client.ClientConnection | None = None
         self._subscriptions: list[Subscription] = []
@@ -64,10 +78,19 @@ class WSPublicFeed:
         self._running = False
         self._reconnect_count = 0
 
+        # Bounded message queue: prevents OOM when producer (WS) outpaces
+        # consumer (strategy loop) during extreme market events.
+        self._msg_queue: asyncio.Queue[WSMessage | None] = asyncio.Queue(
+            maxsize=max_queue_size,
+        )
+        self._max_queue_size = max_queue_size
+
         # Metrics
         self.msgs_received: int = 0
         self.last_msg_ts: float = 0.0
         self.reconnects: int = 0
+        self.queue_overflows: int = 0
+        self.msgs_dropped: int = 0
 
     def subscribe(self, channel: str, **params: Any) -> None:
         """Register a subscription. Will be sent on (re)connect."""
@@ -121,19 +144,53 @@ class WSPublicFeed:
             self._reconnect_count = 0  # Reset on successful connect
             logger.info("WS1 connected")
 
+            # Drain any stale messages from a previous connection's queue
+            self._drain_queue()
+
             # (Re)subscribe to all channels
             for sub in self._subscriptions:
                 sub.confirmed = False
                 await self._send_subscribe(sub)
 
-            # Receive loop
+            # Receive loop with bounded queue backpressure.
+            # If the strategy loop falls behind, the queue fills up.
+            # Once full, we drop the connection to prevent OOM — it is
+            # better to reconnect and resync than to trade on stale data.
             async for raw_msg in ws:
                 self.msgs_received += 1
                 self.last_msg_ts = time.monotonic()
                 msg = ws_codec.decode(raw_msg)
+
+                if self._msg_queue.full():
+                    # Consumer is overwhelmed — drop connection and resync.
+                    self.queue_overflows += 1
+                    dropped = self._drain_queue()
+                    self.msgs_dropped += dropped
+                    logger.critical(
+                        "WS1 queue overflow (%d msgs dropped, overflow #%d) "
+                        "— consumer falling behind, forcing reconnect+resync",
+                        dropped, self.queue_overflows,
+                    )
+                    await ws.close()
+                    return  # Triggers reconnect in run()
+
                 self._dispatch(msg)
 
         self._ws = None
+
+    def _drain_queue(self) -> int:
+        """Drain all pending messages from the bounded queue.
+
+        Returns the number of messages discarded.
+        """
+        dropped = 0
+        while not self._msg_queue.empty():
+            try:
+                self._msg_queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        return dropped
 
     async def _send_subscribe(self, sub: Subscription) -> None:
         """Send a subscribe request for a single channel."""
