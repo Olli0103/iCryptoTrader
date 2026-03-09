@@ -763,6 +763,123 @@ def _run_backtest(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bot analysis CLI
+# ---------------------------------------------------------------------------
+
+
+async def _run_bot_analysis(cfg: Config, args: argparse.Namespace) -> None:
+    """Connect to Kraken WS, collect trades + book data, and analyze bot patterns."""
+    from icryptotrader.analysis.book_analyzer import BookAnalyzer
+    from icryptotrader.analysis.bot_detector import BotDetector
+    from icryptotrader.ws.book_manager import OrderBook
+    from icryptotrader.ws.ws_codec import WSMessage
+    from icryptotrader.ws.ws_public import WSPublicFeed
+
+    duration = args.duration
+    print(
+        f"Analyzing Kraken {cfg.pair} for bot activity "
+        f"({duration}s observation window)..."
+    )
+    print("Connecting to Kraken WebSocket...")
+
+    detector = BotDetector(window_sec=float(duration))
+    book_analyzer = BookAnalyzer(window_sec=float(duration))
+    order_book = OrderBook(symbol=cfg.pair)
+
+    ws = WSPublicFeed(url=cfg.kraken.ws_public_url)
+    ws.subscribe("trade", symbol=[cfg.pair])
+    ws.subscribe("book", symbol=[cfg.pair], depth=10)
+
+    trade_count = 0
+    book_updates = 0
+
+    def _on_trade(msg: object) -> None:
+        nonlocal trade_count
+        assert isinstance(msg, WSMessage)
+        for td in msg.data:
+            side = td.get("side", "")
+            qty_str = str(td.get("qty", "0"))
+            price_str = str(td.get("price", "0"))
+            if side and qty_str != "0":
+                detector.record_trade(
+                    side=side,
+                    qty=Decimal(qty_str),
+                    price=Decimal(price_str),
+                )
+                trade_count += 1
+
+    def _on_book(msg: object) -> None:
+        nonlocal book_updates
+        assert isinstance(msg, WSMessage)
+        if not msg.data:
+            return
+        book_data = msg.data[0] if isinstance(msg.data, list) else msg.data
+        if msg.data_type == "snapshot":
+            order_book.apply_snapshot(book_data)
+        else:
+            order_book.apply_update(book_data)
+
+        if order_book.is_valid:
+            # Extract top levels for book analysis
+            bids_raw = sorted(
+                order_book._bids.items(), key=lambda x: x[0], reverse=True,
+            )[:10]
+            asks_raw = sorted(
+                order_book._asks.items(), key=lambda x: x[0],
+            )[:10]
+            book_analyzer.record_snapshot(
+                bids=bids_raw,
+                asks=asks_raw,
+                mid_price=order_book.mid_price,
+                spread_bps=order_book.spread_bps,
+            )
+            book_updates += 1
+
+    ws.on_channel("trade", _on_trade)
+    ws.on_channel("book", _on_book)
+
+    ws_task = asyncio.create_task(ws.run())
+
+    # Progress updates
+    elapsed = 0
+    interval = min(30, duration // 5) or 10
+    try:
+        while elapsed < duration:
+            wait = min(interval, duration - elapsed)
+            await asyncio.sleep(wait)
+            elapsed += wait
+            pct = min(100, int(elapsed / duration * 100))
+            print(
+                f"  [{pct:3d}%] {elapsed}s / {duration}s — "
+                f"{trade_count} trades, {book_updates} book updates"
+            )
+    except asyncio.CancelledError:
+        pass
+
+    # Analyze
+    print("\nAnalyzing collected data...\n")
+    trade_report = detector.analyze()
+    book_report = book_analyzer.analyze()
+
+    output = []
+    output.append(trade_report.summary())
+    output.append("")
+    output.append(book_report.summary())
+
+    full_report = "\n".join(output)
+    print(full_report)
+
+    if args.output:
+        Path(args.output).write_text(full_report)
+        print(f"\nReport saved to {args.output}")
+
+    # Cleanup
+    ws_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await ws_task
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -790,6 +907,21 @@ def main() -> None:
     # setup
     sub.add_parser("setup", help="Run interactive setup wizard")
 
+    # analyze-bots
+    ab_parser = sub.add_parser(
+        "analyze-bots",
+        help="Analyze Kraken trade stream for bot activity patterns",
+    )
+    ab_parser.add_argument("--config", "-c", type=str, help="Config file path")
+    ab_parser.add_argument(
+        "--duration", "-t", type=int, default=300,
+        help="Observation duration in seconds (default: 300)",
+    )
+    ab_parser.add_argument(
+        "--output", "-o", type=str,
+        help="Save report to file (text format)",
+    )
+
     args = parser.parse_args()
 
     # Default to "run" when no subcommand given
@@ -806,6 +938,13 @@ def main() -> None:
         cfg = load_config(config_path)
         setup_logging(level=cfg.log_level)
         _run_backtest(args)
+        return
+
+    if command == "analyze-bots":
+        config_path = Path(args.config) if args.config else None
+        cfg = load_config(config_path)
+        setup_logging(level=cfg.log_level)
+        asyncio.run(_run_bot_analysis(cfg, args))
         return
 
     # command == "run"
